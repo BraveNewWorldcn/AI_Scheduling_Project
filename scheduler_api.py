@@ -1059,12 +1059,8 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         if inv_info is None:
             print(f"⚠️ 库存未匹配 合同={contract_id} SKU={sku_code} 规格={safe_str(row_dict.get('规格', ''))[:50]} → {_inv_how}")
 
-        # 以库存快照表的库存日期作为 ETA 基准日；缺失则回退到“库存表最新日期”，再回退 today
-        stock_base_date = inv_latest_date or today
-        if inv_info:
-            stock_dt = pd.to_datetime(inv_info.get("库存日期", None), errors="coerce")
-            if not pd.isna(stock_dt):
-                stock_base_date = stock_dt.date()
+        # 以当前系统运行日期作为 ETA 基准日
+        stock_base_date = today
 
         reserved = locked_stock.get(sku_code, 0.0)
         available = calc_available_stock(inv_info, reserved_qty=reserved)
@@ -1186,6 +1182,53 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     summary, delayed_cnt = apply_capacity_scheduling(summary, today=today)
     if delayed_cnt:
         print(f"📦 产能限制生效：{delayed_cnt} 单被顺延到后续日期")
+
+    # ===== 强制类型转换并打印 =====
+    def convert_summary_row(row):
+        converted = {}
+        for key, value in row.items():
+            if key == "合同编号":
+                converted[key] = str(value) if value is not None else ""
+            elif key == "项目类型":
+                converted[key] = str(value) if value is not None else ""
+            elif key == "订单SKU总数":
+                converted[key] = int(value) if value is not None and value != "" else 0
+            elif key == "订单总数量":
+                converted[key] = int(value) if value is not None and value != "" else 0
+            elif key == "缺货SKU数":
+                converted[key] = int(value) if value is not None and value != "" else 0
+            elif key == "缺货SKU列表":
+                converted[key] = str(value) if value is not None else ""
+            elif key == "整体状态":
+                converted[key] = str(value) if value is not None else ""
+            elif key == "AI建议发货时间":
+                if value is not None and value != "":
+                    if isinstance(value, str):
+                        converted[key] = value  # 已经是 'YYYY-MM-DD'
+                    elif isinstance(value, date):
+                        converted[key] = value.strftime("%Y-%m-%d")
+                    else:
+                        # 跳过
+                        pass
+                # else 跳过不写入
+            elif key == "排单批次号":
+                converted[key] = str(value) if value is not None else ""
+            elif key == "是否人工确认":
+                bool_val = bool(value) if value is not None else False
+                converted[key] = "是" if bool_val else "否"
+            elif key == "人工确认发货时间":
+                converted[key] = str(value) if value is not None else ""
+            else:
+                converted[key] = value
+        return converted
+
+    converted_summary_rows = []
+    for _, row in summary.iterrows():
+        converted_row = convert_summary_row(row.to_dict())
+        print(f"转换后数据类型和值: { {k: (type(v).__name__, v) for k, v in converted_row.items()} }")
+        converted_summary_rows.append(converted_row)
+
+    summary = pd.DataFrame(converted_summary_rows)
 
     # ===== 写入飞书结果表 =====
     # 先清空结果表（可选，避免数据重复）—— 此处简单起见，直接追加写入
