@@ -917,7 +917,7 @@ def calc_order_ship_date_for_group(
         # 预计到货日期已在明细回填时写入；这里取 max
         eta_dates = pd.to_datetime(group.loc[shortage_mask, "预计到货日期"], errors="coerce").dt.date
         latest_eta = eta_dates.max()
-        if latest_eta:
+        if pd.notna(latest_eta):
             return latest_eta
         # 若缺失，兜底：按 25 天
         return today + timedelta(days=25)
@@ -930,7 +930,7 @@ def calc_order_ship_date_for_group(
             return today + timedelta(days=1)
         eta_dates = pd.to_datetime(group.loc[shortage_mask, "预计到货日期"], errors="coerce").dt.date
         latest_eta = eta_dates.max()
-        if latest_eta:
+        if pd.notna(latest_eta):
             return latest_eta
         return today + timedelta(days=25)
 
