@@ -223,14 +223,13 @@ def load_feishu_data():
     print(f"库存数据：{len(stock_df)} 条")
     return orders_df, sku_df, stock_df
 
-# 写入飞书时，「日期」类字段需传毫秒时间戳；传纯字符串易触发 DatetimeFieldConvFail
-FEISHU_DATE_COLUMN_NAMES = {
-    "预计到货日期",
-    "下单日期",
-    "库存日期",
-    "AI建议发货时间",
-    "人工确认发货时间",
-}
+# 写入飞书时，字段类型必须匹配，否则会出现：
+# - DatetimeFieldConvFail：日期字段写入了字符串/不支持的格式
+# - TextFieldConvFail：文本字段写入了数字/时间戳
+#
+# 这里按“写入目标表”分别控制：不要用一个全局集合硬套所有表。
+DETAIL_DATE_COLS_DEFAULT = {"预计到货日期"}   # 销售订单明细表：预计到货日期通常是日期字段
+DETAIL_NUMERIC_COLS_DEFAULT = {"库存可用量", "缺口数量"}  # 明细回填：数值字段
 
 
 def to_feishu_date_millis(val: Any) -> Optional[int]:
@@ -263,7 +262,14 @@ def to_feishu_date_millis(val: Any) -> Optional[int]:
     return int(dt.timestamp() * 1000)
 
 
-def write_df_to_bitable(table_id, df, fields_map=None):
+def write_df_to_bitable(
+    table_id,
+    df,
+    fields_map=None,
+    *,
+    numeric_cols: Optional[set] = None,
+    date_cols: Optional[set] = None,
+):
     """
     将 DataFrame 写入飞书多维表格（逐条写入，简单可靠）
     
@@ -277,19 +283,11 @@ def write_df_to_bitable(table_id, df, fields_map=None):
     if fields_map is None:
         fields_map = {}
     
-    # 飞书多维表格的“数字字段”必须写入 number 类型，否则会报 NumberFieldConvFail
-    numeric_fields = {
-        "库存可用量",
-        "缺口数量",
-        "合同数量",
-        "订单SKU总数",
-        "订单总数量",
-        "缺货SKU数",
-        "优先级",
-    }
+    numeric_fields = set(numeric_cols or set())
+    date_fields = set(date_cols or set())
 
     def feishu_value(col_name: str, val):
-        if col_name in FEISHU_DATE_COLUMN_NAMES:
+        if col_name in date_fields:
             ms = to_feishu_date_millis(val)
             if ms is None:
                 return None
@@ -350,7 +348,15 @@ def write_df_to_bitable(table_id, df, fields_map=None):
             print(f"   字段名: {list(fields.keys())}")
 
 
-def update_bitable_records(table_id: str, df: pd.DataFrame, record_id_col: str = "_record_id", fields_map=None):
+def update_bitable_records(
+    table_id: str,
+    df: pd.DataFrame,
+    record_id_col: str = "_record_id",
+    fields_map=None,
+    *,
+    numeric_cols: Optional[set] = None,
+    date_cols: Optional[set] = None,
+):
     """按 record_id 更新飞书多维表格的原记录（用于“订单明细回填”）。
 
     说明：df 必须包含 record_id_col 列；fields_map 用于将 df 列名映射到飞书字段名。
@@ -364,18 +370,12 @@ def update_bitable_records(table_id: str, df: pd.DataFrame, record_id_col: str =
     if record_id_col not in df.columns:
         raise ValueError(f"df 缺少 {record_id_col} 列，无法更新回填")
 
-    numeric_fields = {
-        "库存可用量",
-        "缺口数量",
-        "合同数量",
-        "订单SKU总数",
-        "订单总数量",
-        "缺货SKU数",
-        "优先级",
-    }
+    # 字段类型由调用方按目标表显式传入，避免 TextFieldConvFail / DatetimeFieldConvFail
+    numeric_fields = set(numeric_cols or set())
+    date_fields = set(date_cols or set())
 
     def feishu_value(col_name: str, val):
-        if col_name in FEISHU_DATE_COLUMN_NAMES:
+        if col_name in date_fields:
             ms = to_feishu_date_millis(val)
             if ms is None:
                 return None
@@ -1035,6 +1035,16 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     # 第一步：回填“销售订单明细表”字段（库存可用量/缺口/库存状态/预计到货/是否RB800/排单批次号）
     # =========================
     today = datetime.today().date()
+
+    # 库存快照表的“全表最新库存日期”（当某SKU未匹配到库存行时，用它做 ETA 基准日）
+    inv_latest_date = today
+    try:
+        inv_dt = pd.to_datetime(inv.get("库存日期", pd.Series(dtype=str)), errors="coerce")
+        inv_dt = inv_dt.dropna()
+        if not inv_dt.empty:
+            inv_latest_date = inv_dt.max().date()
+    except Exception:
+        pass
     backfill_rows = []
 
     for _, row in items.iterrows():
@@ -1049,8 +1059,8 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         if inv_info is None:
             print(f"⚠️ 库存未匹配 合同={contract_id} SKU={sku_code} 规格={safe_str(row_dict.get('规格', ''))[:50]} → {_inv_how}")
 
-        # 以库存快照表的库存日期作为 ETA 基准日；缺失则回退到 today
-        stock_base_date = today
+        # 以库存快照表的库存日期作为 ETA 基准日；缺失则回退到“库存表最新日期”，再回退 today
+        stock_base_date = inv_latest_date or today
         if inv_info:
             stock_dt = pd.to_datetime(inv_info.get("库存日期", None), errors="coerce")
             if not pd.isna(stock_dt):
@@ -1081,7 +1091,13 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
     df_backfill = pd.DataFrame(backfill_rows)
     print("正在回填销售订单明细表...")
-    update_bitable_records(TABLE_ID_ITEMS, df_backfill, record_id_col="_record_id")
+    update_bitable_records(
+        TABLE_ID_ITEMS,
+        df_backfill,
+        record_id_col="_record_id",
+        numeric_cols=DETAIL_NUMERIC_COLS_DEFAULT,
+        date_cols=DETAIL_DATE_COLS_DEFAULT,
+    )
 
     # =========================
     # 第二步开始前：重新读取“已回填”的销售订单明细表
