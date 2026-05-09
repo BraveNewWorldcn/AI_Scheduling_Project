@@ -2,6 +2,8 @@ from fastapi import FastAPI, Request
 import os
 import re
 import time
+from contextlib import contextmanager
+from functools import wraps
 from pydantic import BaseModel
 import pandas as pd
 from datetime import datetime, timedelta, date, timezone
@@ -73,7 +75,8 @@ TABLE_ID_ITEMS = "tblJn5iP6imjzE8h"                   # 销售订单明细表 ID
 TABLE_ID_SKU   = "tblVAGWeGHvmbFgJ"                   # SKU标准表 ID（必需）
 TABLE_ID_INV   = "tblFZNdEwW50izjh"                   # 库存快照表 ID（必需）
 TABLE_ID_SUMMARY = "tblgMzZPyBBU5GLX"                 # 合同缺货总览表 ID（输出）
-TABLE_ID_DETAIL = "tbl09Z6C7wCGh3mW"
+TABLE_ID_DETAIL = "tbl09Z6C7wCGh3mW"                  # AI排单总表（输出）
+TABLE_ID_RESERVATION = "tblDD1jL8bcEvm2L"             # AI排单_库存预留表 ID（必需，建议用环境变量覆盖）
 
 # 环境变量优先于上方默认值（部署时可覆盖，避免硬编码写死）
 if os.getenv("TABLE_ID_ITEMS"):
@@ -86,6 +89,8 @@ if os.getenv("TABLE_ID_SUMMARY"):
     TABLE_ID_SUMMARY = os.getenv("TABLE_ID_SUMMARY").strip()
 if os.getenv("TABLE_ID_DETAIL"):
     TABLE_ID_DETAIL = os.getenv("TABLE_ID_DETAIL").strip()
+if os.getenv("TABLE_ID_RESERVATION"):
+    TABLE_ID_RESERVATION = os.getenv("TABLE_ID_RESERVATION").strip()
 
 # ===== 输出表字段映射 =====
 # 当飞书表中的字段名与代码中的字段名不一致时，在这里进行映射
@@ -113,12 +118,16 @@ OUTPUT_SUMMARY_FIELDS_MAP = {
     "整体状态": "整体状态",
     "AI建议发货时间": "AI建议发货时间",
     "排单批次号": "排单批次号",
+    "订单状态": "订单状态",
     "是否人工确认": "是否人工确认",
     "人工确认发货时间": "人工确认发货时间"
 }
 # ================================================
 SUMMARY_NUMERIC_COLS_DEFAULT = {"订单SKU总数", "订单总数量", "缺货SKU数"}
 SUMMARY_DATE_COLS_DEFAULT = {"AI建议发货时间", "人工确认发货时间"}
+RESERVATION_NUMERIC_COLS_DEFAULT = {"预留数量"}
+RESERVATION_DATE_COLS_DEFAULT = {"创建时间"}
+SCHEDULE_LOCK_PATH = os.path.join(CACHE_DIR, "schedule_global.lock")
 app = FastAPI()
 
 # =========================
@@ -243,6 +252,50 @@ def to_feishu_date_millis(val: Any) -> Optional[int]:
     cn = timezone(timedelta(hours=8))
     dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=cn)
     return int(dt.timestamp() * 1000)
+
+
+@contextmanager
+def schedule_global_lock(timeout_seconds: int = 1):
+    """用锁文件做跨进程互斥，避免多实例同时执行排单。"""
+    start = time.time()
+    fd = None
+    while True:
+        try:
+            fd = os.open(SCHEDULE_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, f"{os.getpid()} {datetime.now().isoformat()}".encode("utf-8"))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(SCHEDULE_LOCK_PATH) > 60 * 60:
+                    os.remove(SCHEDULE_LOCK_PATH)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.time() - start >= timeout_seconds:
+                raise RuntimeError("排单任务正在执行，本次请求已拒绝，避免多实例并发写入")
+            time.sleep(0.2)
+
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.remove(SCHEDULE_LOCK_PATH)
+        except FileNotFoundError:
+            pass
+
+
+def with_schedule_lock(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            with schedule_global_lock(timeout_seconds=1):
+                return func(*args, **kwargs)
+        except RuntimeError as e:
+            print(f"⛔ {e}")
+            return {"msg": "排单任务已被互斥锁阻止", "error": str(e)}
+    return wrapper
 
 
 def write_df_to_bitable(
@@ -655,6 +708,35 @@ def date_to_yyyy_mm_dd(val: Any) -> str:
     return d.strftime("%Y-%m-%d") if d else ""
 
 
+def json_safe_value(value: Any) -> Any:
+    """递归清理 NaN/NaT/Timestamp，保证 FastAPI JSONResponse 可序列化。"""
+    if isinstance(value, dict):
+        return {k: json_safe_value(v) for k, v in value.items() if not (isinstance(k, str) and k.startswith("_"))}
+    if isinstance(value, list):
+        return [json_safe_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [json_safe_value(v) for v in value]
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return date_to_yyyy_mm_dd(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def public_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    public_df = df.copy()
+    internal_cols = [c for c in public_df.columns if isinstance(c, str) and c.startswith("_")]
+    if internal_cols:
+        public_df = public_df.drop(columns=internal_cols, errors="ignore")
+    public_df = public_df.astype(object).where(pd.notnull(public_df), None)
+    return json_safe_value(public_df.to_dict(orient="records"))
+
+
 def normalize_shortage_sku_list(value: Any) -> List[str]:
     """把缺货 SKU 列表规整为去重后的 SKU 数组，供数量和写入共用。"""
     if isinstance(value, list):
@@ -734,10 +816,212 @@ def is_effective_manual_confirmed(row: Dict[str, Any]) -> bool:
     return safe_str(row.get("是否人工确认", "")) == "是" and has_valid_manual_confirm_date(row)
 
 
-def calc_available_stock(inv_row: Optional[Dict[str, Any]], reserved_qty: float = 0.0) -> float:
-    """可用库存 = 库存快照表的库存数量 - 已占用排单库存(仅锁单保留)。
+def normalize_order_status(value: Any, default: str = "待确认") -> str:
+    status = safe_str(value)
+    if status in {"待确认", "已确认", "已发货"}:
+        return status
+    return default
 
-    简单模式：库存快照每次全量覆盖；不做非锁单的占用追踪。
+
+def normalize_reservation_status(value: Any, default: str = "有效") -> str:
+    status = safe_str(value)
+    if status in {"有效", "已转换", "已过期"}:
+        return status
+    return default
+
+
+def is_confirmed_order(row: Dict[str, Any]) -> bool:
+    return normalize_order_status(row.get("订单状态", "")) == "已确认"
+
+
+def make_run_batch_id(reservations: pd.DataFrame, today: date) -> str:
+    prefix = f"RUN-{today.strftime('%Y%m%d')}-"
+    max_seq = 0
+    if reservations is not None and not reservations.empty and "批次号" in reservations.columns:
+        for value in reservations["批次号"].astype(str):
+            m = re.fullmatch(re.escape(prefix) + r"(\d{3})", safe_str(value))
+            if m:
+                max_seq = max(max_seq, int(m.group(1)))
+    return f"{prefix}{max_seq + 1:03d}"
+
+
+def ensure_reservation_table_id() -> Optional[str]:
+    if TABLE_ID_RESERVATION:
+        return None
+    return "缺少 AI排单_库存预留表 ID，请配置环境变量 TABLE_ID_RESERVATION"
+
+
+def prepare_summary_status(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None:
+        return pd.DataFrame()
+    out = summary.copy()
+    if out.empty:
+        return out
+    if "订单状态" not in out.columns:
+        out["订单状态"] = "待确认"
+    out["订单状态"] = out["订单状态"].apply(normalize_order_status)
+    if "合同编号" in out.columns:
+        out["合同编号"] = out["合同编号"].astype(str).apply(safe_str)
+    return out
+
+
+def summarize_confirmed_stock(summary: pd.DataFrame, detail: pd.DataFrame) -> Dict[str, float]:
+    locked_stock: Dict[str, float] = {}
+    summary = prepare_summary_status(summary)
+    if summary.empty or detail is None or detail.empty or "合同编号" not in detail.columns:
+        return locked_stock
+
+    confirmed_contracts = set(
+        summary.loc[summary["订单状态"] == "已确认", "合同编号"].astype(str).apply(safe_str)
+    )
+    if not confirmed_contracts:
+        return locked_stock
+
+    source = detail.copy()
+    source["合同编号"] = source["合同编号"].astype(str).apply(safe_str)
+    if "SKU编码" not in source.columns or "合同数量" not in source.columns:
+        return locked_stock
+
+    locked_detail = source[source["合同编号"].isin(confirmed_contracts)]
+    for _, r in locked_detail.iterrows():
+        sku_code = safe_str(r.get("SKU编码", ""))
+        qty = to_num(r.get("合同数量", 0))
+        if sku_code and qty > 0:
+            locked_stock[sku_code] = locked_stock.get(sku_code, 0.0) + qty
+    return locked_stock
+
+
+def get_confirmed_contract_ids(summary: pd.DataFrame) -> set:
+    summary = prepare_summary_status(summary)
+    if summary.empty or "合同编号" not in summary.columns:
+        return set()
+    return set(summary.loc[summary["订单状态"] == "已确认", "合同编号"].astype(str).apply(safe_str))
+
+
+def summarize_effective_reservations(reservations: pd.DataFrame) -> Dict[str, float]:
+    reserved_stock: Dict[str, float] = {}
+    if reservations is None or reservations.empty:
+        return reserved_stock
+    required = {"SKU", "预留数量", "状态"}
+    if not required.issubset(set(reservations.columns)):
+        return reserved_stock
+
+    active = reservations[reservations["状态"].apply(normalize_reservation_status) == "有效"]
+    for _, r in active.iterrows():
+        sku_code = safe_str(r.get("SKU", ""))
+        qty = to_num(r.get("预留数量", 0))
+        if sku_code and qty > 0:
+            reserved_stock[sku_code] = reserved_stock.get(sku_code, 0.0) + qty
+    return reserved_stock
+
+
+def update_reservation_records(records: pd.DataFrame, status: str, reason: str) -> int:
+    if records is None or records.empty:
+        return 0
+    if "_record_id" not in records.columns:
+        return 0
+    df = records[["_record_id"]].copy()
+    df["状态"] = status
+    df["释放原因"] = reason
+    update_bitable_records(TABLE_ID_RESERVATION, df, record_id_col="_record_id")
+    return int(len(df))
+
+
+def cleanup_reservations(
+    reservations: pd.DataFrame,
+    summary: pd.DataFrame,
+    current_batch_id: str,
+) -> Tuple[int, int]:
+    if reservations is None or reservations.empty:
+        return 0, 0
+    res = reservations.copy()
+    if "状态" not in res.columns:
+        res["状态"] = ""
+    if "批次号" not in res.columns:
+        res["批次号"] = ""
+    if "合同编号" not in res.columns:
+        res["合同编号"] = ""
+
+    summary = prepare_summary_status(summary)
+    confirmed_contracts = set()
+    if not summary.empty and "合同编号" in summary.columns:
+        confirmed_contracts = set(summary.loc[summary["订单状态"] == "已确认", "合同编号"].astype(str).apply(safe_str))
+
+    active_mask = res["状态"].apply(normalize_reservation_status) == "有效"
+    converted_count = 0
+    if confirmed_contracts:
+        converted = res[active_mask & res["合同编号"].astype(str).apply(safe_str).isin(confirmed_contracts)]
+        converted_count = update_reservation_records(converted, "已转换", "人工确认自动转换")
+
+    expired = res[
+        active_mask
+        & (res["批次号"].astype(str).apply(safe_str) != current_batch_id)
+        & ~res["合同编号"].astype(str).apply(safe_str).isin(confirmed_contracts)
+    ]
+    expired_count = update_reservation_records(expired, "已过期", "超期未确认")
+
+    return expired_count, converted_count
+
+
+def release_old_contract_reservations(reservations: pd.DataFrame, contract_ids: List[str]) -> int:
+    if reservations is None or reservations.empty or not contract_ids:
+        return 0
+    required = {"合同编号", "状态"}
+    if not required.issubset(set(reservations.columns)):
+        return 0
+    contract_set = {safe_str(x) for x in contract_ids if safe_str(x)}
+    active = reservations[
+        (reservations["状态"].apply(normalize_reservation_status) == "有效")
+        & reservations["合同编号"].astype(str).apply(safe_str).isin(contract_set)
+    ]
+    return update_reservation_records(active, "已过期", "新一轮排单覆盖")
+
+
+def build_reservation_rows(summary: pd.DataFrame, detail: pd.DataFrame, batch_id: str) -> pd.DataFrame:
+    if summary is None or summary.empty or detail is None or detail.empty:
+        return pd.DataFrame()
+    summary = prepare_summary_status(summary)
+    pending_contracts = set(summary.loc[summary["订单状态"] == "待确认", "合同编号"].astype(str).apply(safe_str))
+    if not pending_contracts:
+        return pd.DataFrame()
+
+    required = {"合同编号", "SKU编码", "合同数量"}
+    if not required.issubset(set(detail.columns)):
+        return pd.DataFrame()
+
+    qty_by_contract_sku: Dict[Tuple[str, str], float] = {}
+    now_str = datetime.now().strftime("%Y-%m-%d")
+    source = detail.copy()
+    source["合同编号"] = source["合同编号"].astype(str).apply(safe_str)
+    source["SKU编码"] = source["SKU编码"].astype(str).apply(safe_str)
+    for _, r in source[source["合同编号"].isin(pending_contracts)].iterrows():
+        contract_id = safe_str(r.get("合同编号", ""))
+        sku_code = safe_str(r.get("SKU编码", ""))
+        qty = to_num(r.get("合同数量", 0))
+        if not contract_id or not sku_code or qty <= 0:
+            continue
+        key = (contract_id, sku_code)
+        qty_by_contract_sku[key] = qty_by_contract_sku.get(key, 0.0) + qty
+
+    rows = []
+    for (contract_id, sku_code), qty in qty_by_contract_sku.items():
+        rows.append({
+            "预留ID": f"{batch_id}_{contract_id}_{sku_code}",
+            "合同编号": contract_id,
+            "SKU": sku_code,
+            "预留数量": qty,
+            "批次号": batch_id,
+            "创建时间": now_str,
+            "状态": "有效",
+            "释放原因": "",
+        })
+    return pd.DataFrame(rows)
+
+
+def calc_available_stock(inv_row: Optional[Dict[str, Any]], reserved_qty: float = 0.0) -> float:
+    """可用库存 = 库存快照表数量 - 已确认订单占用 - 有效预留。
+
+    reserved_qty 由调用方传入，包含 AI排单总表已确认订单需求和库存预留表有效预留。
     """
     if not inv_row:
         base = 0.0
@@ -906,7 +1190,7 @@ def calc_daily_capacity(sku_kinds: int, total_qty: float, base: int = 5) -> int:
 def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.DataFrame, int]:
     """对 AI排单总表应用每日产能限制。
 
-    - 锁单（是否人工确认=是）：完全不动
+    - 人工状态订单（订单状态=已确认/已发货）：完全不动
     - 特殊订单（项目类型=特殊订单）：不计入每日5单限制，也不动
     - 其他订单：若某日超产能，将 `AI建议发货时间` 顺延到后续日期
 
@@ -918,7 +1202,10 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
     df = summary.copy()
     df["__ship_date"] = df["AI建议发货时间"].apply(lambda x: next_working_day(parse_date_to_date(x) or today))
 
-    df["__locked"] = df.apply(lambda r: is_effective_manual_confirmed(r.to_dict()), axis=1)
+    if "订单状态" not in df.columns:
+        df["订单状态"] = "待确认"
+    df["订单状态"] = df["订单状态"].apply(normalize_order_status)
+    df["__locked"] = df["订单状态"] != "待确认"
     df["__special"] = df.get("项目类型", "").astype(str) == "特殊订单"
 
     # 只对“非锁定 + 非特殊”应用产能
@@ -1045,8 +1332,12 @@ def calc_order_ship_date_for_group(
 
 
 @app.post("/schedule")
+@with_schedule_lock
 def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     """AI排单主函数"""
+    reservation_config_error = ensure_reservation_table_id()
+    if reservation_config_error:
+        return {"error": reservation_config_error}
 
     # =========================
     # 从飞书直接加载最新数据
@@ -1057,9 +1348,26 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     items = data_cache["items"]
     sku   = data_cache["sku"]
     inv   = data_cache["inv"]
-    # ===== 生成排单ID & 排单批次号 =====
+    today = datetime.today().date()
+
+    # ===== 实时读取 AI排单总表与库存预留表 =====
+    try:
+        old_summary = prepare_summary_status(fetch_bitable_to_df(TABLE_ID_DETAIL))
+    except Exception as e:
+        return {"error": f"读取 AI排单总表失败：{e}"}
+
+    try:
+        reservations = fetch_bitable_to_df(TABLE_ID_RESERVATION)
+    except Exception as e:
+        return {"error": f"读取 AI排单_库存预留表失败：{e}"}
+
+    # ===== 生成排单ID & 本次批次号 =====
     schedule_id = datetime.now().strftime("SCH%Y%m%d%H%M%S")
-    batch_id = datetime.now().strftime("BATCH%Y%m%d")
+    batch_id = make_run_batch_id(reservations, today)
+    expired_count, converted_count = cleanup_reservations(reservations, old_summary, batch_id)
+    if expired_count or converted_count:
+        print(f"🧹 预留清洁完成：过期 {expired_count} 条，转换 {converted_count} 条")
+    reservations = fetch_bitable_to_df(TABLE_ID_RESERVATION)
     
     # ===== 表字段存在性快速检查 =====
     if "产品编码SKU" not in sku.columns:
@@ -1072,63 +1380,22 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         print(error_msg)
         return {"error": error_msg}
     # =========================
-    # 读取历史排单（用于人工锁单保护 + 锁单库存占用）
+    # 实时计算库存占用：已确认订单需求 + 有效预留
     # =========================
-    try:
-        old_summary = pd.read_csv(f"{CACHE_DIR}/ai_schedule_summary.csv")
-        print("已加载历史排单缓存")
-    except:
-        old_summary = pd.DataFrame()
-
-    # 兼容旧缓存列名：历史版本可能用 AI订单ID 表示合同编号
-    if not old_summary.empty:
-        if "合同编号" not in old_summary.columns and "AI订单ID" in old_summary.columns:
-            old_summary = old_summary.rename(columns={"AI订单ID": "合同编号"})
-        if "合同编号" in old_summary.columns:
-            old_summary["合同编号"] = old_summary["合同编号"].astype(str).apply(safe_str)
-        if "是否人工确认" not in old_summary.columns:
-            old_summary["是否人工确认"] = "否"
-        if "人工确认发货时间" not in old_summary.columns:
-            old_summary["人工确认发货时间"] = ""
-        old_summary["是否人工确认"] = old_summary.apply(
-            lambda r: "是" if is_effective_manual_confirmed(r.to_dict()) else "否",
-            axis=1,
-        )
-        if "AI建议发货时间" in old_summary.columns:
-            old_summary["AI建议发货时间"] = old_summary["AI建议发货时间"].apply(date_to_yyyy_mm_dd)
-        old_summary["人工确认发货时间"] = old_summary["人工确认发货时间"].apply(date_to_yyyy_mm_dd)
-    # =========================
-    # 计算已锁单库存占用（关键AI逻辑）
-    # =========================
-    locked_stock: Dict[str, float] = {}
-
-    if not old_summary.empty:
-        locked_orders = old_summary[old_summary.apply(lambda r: is_effective_manual_confirmed(r.to_dict()), axis=1)]
-
-        if not locked_orders.empty:
-            try:
-                old_detail = pd.read_csv(f"{CACHE_DIR}/ai_schedule_detail.csv")
-            except:
-                old_detail = pd.DataFrame()
-
-            if not old_detail.empty:
-                # old_detail 使用“销售订单明细表”的合同编号
-                locked_detail = old_detail[old_detail["合同编号"].isin(locked_orders["合同编号"])]
-
-                for _, r in locked_detail.iterrows():
-                    sku_code = safe_str(r.get("SKU编码", ""))
-                    qty = to_num(r.get("合同数量", 0))
-
-                    locked_stock[sku_code] = locked_stock.get(sku_code, 0) + qty
-        print("🔒 已冻结库存：", locked_stock)
+    confirmed_contract_ids = get_confirmed_contract_ids(old_summary)
+    locked_stock = summarize_confirmed_stock(old_summary, items)
+    active_reserved_stock = summarize_effective_reservations(reservations)
+    occupied_stock: Dict[str, float] = {}
+    for sku_code in set(locked_stock) | set(active_reserved_stock):
+        occupied_stock[sku_code] = locked_stock.get(sku_code, 0.0) + active_reserved_stock.get(sku_code, 0.0)
+    print("🔒 已确认订单占用库存：", locked_stock)
+    print("📌 有效预留占用库存：", active_reserved_stock)
 
     result_rows = []
 
     # =========================
     # 第一步：回填“销售订单明细表”字段（库存可用量/缺口/库存状态/预计到货/是否RB800/排单批次号）
     # =========================
-    today = datetime.today().date()
-
     # 库存快照表的“全表最新库存日期”（当某SKU未匹配到库存行时，用它做 ETA 基准日）
     inv_latest_date = today
     try:
@@ -1148,6 +1415,9 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
         if not sku_code or not contract_id:
             continue
+        if contract_id in confirmed_contract_ids:
+            print(f"🔒 合同 {contract_id} 已确认，销售订单明细表禁止重算和回填")
+            continue
 
         inv_info, _inv_how = find_inventory_row(sku_code, row_dict, inv, sku_df=sku)
         if inv_info is None:
@@ -1155,7 +1425,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
         # 以库存快照最新日期或今天作为 ETA 基准日
 
-        reserved = locked_stock.get(sku_code, 0.0)
+        reserved = occupied_stock.get(sku_code, 0.0)
         available = calc_available_stock(inv_info, reserved_qty=reserved)
 
         demand = to_num(row_dict.get("合同数量", 0))
@@ -1179,14 +1449,17 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         })
 
     df_backfill = pd.DataFrame(backfill_rows)
-    print("正在回填销售订单明细表...")
-    update_bitable_records(
-        TABLE_ID_ITEMS,
-        df_backfill,
-        record_id_col="_record_id",
-        numeric_cols=DETAIL_NUMERIC_COLS_DEFAULT,
-        date_cols=DETAIL_DATE_COLS_DEFAULT,
-    )
+    if df_backfill.empty:
+        print("销售订单明细表无可回填记录（已确认订单已全部跳过或无有效明细）")
+    else:
+        print("正在回填销售订单明细表...")
+        update_bitable_records(
+            TABLE_ID_ITEMS,
+            df_backfill,
+            record_id_col="_record_id",
+            numeric_cols=DETAIL_NUMERIC_COLS_DEFAULT,
+            date_cols=DETAIL_DATE_COLS_DEFAULT,
+        )
 
     # =========================
     # 第二步开始前：重新读取“已回填”的销售订单明细表
@@ -1236,8 +1509,9 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 old_row = old_summary[old_summary["合同编号"] == contract_id]
 
                 if not old_row.empty:
-                    if is_effective_manual_confirmed(old_row.iloc[0].to_dict()):
-                        print(f"🔒 合同 {contract_id} 已人工锁单，跳过AI重算")
+                    old_status = normalize_order_status(old_row.iloc[0].get("订单状态", "待确认"))
+                    if old_status in {"已确认", "已发货"}:
+                        print(f"🔒 合同 {contract_id} 订单状态={old_status}，信任人工状态并跳过AI重算")
                         summary_rows.append(old_row.iloc[0].to_dict())
                         continue
 
@@ -1285,6 +1559,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 "整体状态": overall_status,
                 "AI建议发货时间": date_to_yyyy_mm_dd(next_working_day(ship_date)) if ship_date else "",
                 "排单批次号": batch_id,
+                "订单状态": "待确认",
                 "是否人工确认": "否",
                 "人工确认发货时间": ""
             })
@@ -1322,6 +1597,8 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 converted[key] = date_to_yyyy_mm_dd(next_working_day(parse_date_to_date(value) or datetime.today().date()))
             elif key == "排单批次号":
                 converted[key] = str(value) if value is not None else ""
+            elif key == "订单状态":
+                converted[key] = normalize_order_status(value)
             elif key == "是否人工确认":
                 converted[key] = "是" if safe_str(value) == "是" else "否"
             elif key == "人工确认发货时间":
@@ -1330,6 +1607,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 converted[key] = value
         converted["缺货SKU列表"] = ", ".join(normalize_shortage_sku_list(converted.get("缺货SKU列表", "")))
         converted["缺货SKU数"] = shortage_sku_count_from_list(converted.get("缺货SKU列表", ""))
+        converted["订单状态"] = normalize_order_status(converted.get("订单状态", "待确认"))
         converted["是否人工确认"] = "是" if is_effective_manual_confirmed(converted) else "否"
         return converted
 
@@ -1341,12 +1619,32 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         converted_summary_rows.append(converted_row)
 
     summary = pd.DataFrame(converted_summary_rows)
+    if not summary.empty:
+        summary = summary.drop(columns=[c for c in summary.columns if isinstance(c, str) and c.startswith("_")], errors="ignore")
 
     # ===== 写入飞书结果表 =====
     # 先清空结果表（可选，避免数据重复）—— 此处简单起见，直接追加写入
     # 如果想要覆盖，需要先删除原记录，这里暂不处理，你可手动清空结果表
     
     print("\n【写入结果到飞书】")
+
+    # 写回 AI排单总表前，先刷新待确认订单的库存预留。
+    pending_contracts = []
+    if not summary.empty and "订单状态" in summary.columns:
+        pending_contracts = summary.loc[
+            summary["订单状态"].apply(normalize_order_status) == "待确认",
+            "合同编号",
+        ].astype(str).apply(safe_str).tolist()
+    released_count = release_old_contract_reservations(reservations, pending_contracts)
+    reservation_rows = build_reservation_rows(summary, df_detail, batch_id)
+    if not reservation_rows.empty:
+        write_df_to_bitable(
+            TABLE_ID_RESERVATION,
+            reservation_rows,
+            numeric_cols=RESERVATION_NUMERIC_COLS_DEFAULT,
+            date_cols=RESERVATION_DATE_COLS_DEFAULT,
+        )
+    print(f"📌 库存预留刷新完成：释放旧预留 {released_count} 条，新增预留 {0 if reservation_rows.empty else len(reservation_rows)} 条")
 
     # 明细回填已通过 update_bitable_records 写回销售订单明细表；这里不再新增“明细输出表”。
     # =========================
@@ -1355,8 +1653,8 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     summary.to_csv(f"{CACHE_DIR}/ai_schedule_summary.csv", index=False)
     print("排单缓存已保存")
     
-    summary = summary.where(pd.notnull(summary), None)
-    df_detail = df_detail.where(pd.notnull(df_detail), None)
+    summary = summary.astype(object).where(pd.notnull(summary), None)
+    df_detail = df_detail.astype(object).where(pd.notnull(df_detail), None)
 
     # 汇总数据 → 写入 AI排单总表
     print("正在写入 AI排单总表...")
@@ -1374,7 +1672,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         return {
             "msg": "明细已回填，但 AI排单总表写入失败",
             "error": upsert_err,
-            "AI排单总表": summary.to_dict(orient="records") if not summary.empty else [],
+            "AI排单总表": public_records(summary),
             "回填明细行数": 0 if df_backfill is None else int(len(df_backfill)),
             "顺延订单数": int(delayed_cnt),
             "TABLE_ID_DETAIL": TABLE_ID_DETAIL,
@@ -1383,10 +1681,13 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
     return {
         "msg": "AI排单完成",
-        "AI排单总表": summary.to_dict(orient="records") if not summary.empty else [],
+        "AI排单总表": public_records(summary),
         "回填明细行数": 0 if df_backfill is None else int(len(df_backfill)),
         "顺延订单数": int(delayed_cnt),
-        "notes": "回填已更新销售订单明细表原记录；总表按合同编号更新/新增；特殊订单不计入5单限制；如写入失败请检查飞书字段名是否与代码一致"
+        "预留新增行数": 0 if reservation_rows.empty else int(len(reservation_rows)),
+        "预留释放行数": int(released_count),
+        "批次号": batch_id,
+        "notes": "回填已更新销售订单明细表原记录；总表按合同编号更新/新增；AI仅生成待确认；库存预留已按待确认订单刷新"
     }
 
 # =========================

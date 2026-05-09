@@ -17,7 +17,8 @@ def main():
         "TABLE_ID_SKU",
         "TABLE_ID_INV",
         "TABLE_ID_SUMMARY",
-        "TABLE_ID_DETAIL"
+        "TABLE_ID_DETAIL",
+        "TABLE_ID_RESERVATION"
     ]
 
     missing_vars = []
