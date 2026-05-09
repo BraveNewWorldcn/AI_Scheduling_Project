@@ -117,6 +117,8 @@ OUTPUT_SUMMARY_FIELDS_MAP = {
     "人工确认发货时间": "人工确认发货时间"
 }
 # ================================================
+SUMMARY_NUMERIC_COLS_DEFAULT = {"订单SKU总数", "订单总数量", "缺货SKU数"}
+SUMMARY_DATE_COLS_DEFAULT = {"AI建议发货时间", "人工确认发货时间"}
 app = FastAPI()
 
 # =========================
@@ -234,28 +236,9 @@ DETAIL_NUMERIC_COLS_DEFAULT = {"库存可用量", "缺口数量"}  # 明细回�
 
 def to_feishu_date_millis(val: Any) -> Optional[int]:
     """将日期转为飞书多维表格日期字段可用的毫秒时间戳（北京时间当日 0 点）。"""
-    if val is None:
+    d = parse_date_to_date(val)
+    if d is None:
         return None
-    try:
-        if isinstance(val, float) and pd.isna(val):
-            return None
-    except Exception:
-        pass
-
-    if isinstance(val, pd.Timestamp):
-        d = val.date()
-    elif isinstance(val, datetime):
-        d = val.date()
-    elif isinstance(val, date):
-        d = val
-    else:
-        s = safe_str(val)
-        if not s:
-            return None
-        parsed = pd.to_datetime(s, errors="coerce")
-        if pd.isna(parsed):
-            return None
-        d = parsed.date()
 
     cn = timezone(timedelta(hours=8))
     dt = datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=cn)
@@ -438,6 +421,9 @@ def upsert_bitable_records_by_key(
     df: pd.DataFrame,
     key_col: str,
     key_field_name: str,
+    *,
+    numeric_cols: Optional[set] = None,
+    date_cols: Optional[set] = None,
 ) -> Optional[str]:
     """按“业务唯一键”做 upsert：已有记录则更新，没有则新增。
 
@@ -482,10 +468,10 @@ def upsert_bitable_records_by_key(
             to_create.append(row.to_dict())
 
     if to_update:
-        update_bitable_records(table_id, pd.DataFrame(to_update), record_id_col="_record_id")
+        update_bitable_records(table_id, pd.DataFrame(to_update), record_id_col="_record_id", numeric_cols=numeric_cols, date_cols=date_cols)
 
     if to_create:
-        write_df_to_bitable(table_id, pd.DataFrame(to_create), fields_map=None)
+        write_df_to_bitable(table_id, pd.DataFrame(to_create), fields_map=None, numeric_cols=numeric_cols, date_cols=date_cols)
 
     return None
 
@@ -617,6 +603,135 @@ def to_num(val) -> float:
         return float(val)
     except (ValueError, TypeError):
         return 0.0
+
+
+def parse_date_to_date(val: Any) -> Optional[date]:
+    """兼容飞书日期毫秒值、秒值、日期字符串和 pandas 日期，返回 date。"""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(val, pd.Timestamp):
+        return None if pd.isna(val) else val.date()
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        n = float(val)
+        if n <= 0:
+            return None
+        try:
+            if n >= 10_000_000_000:
+                parsed = pd.to_datetime(n, unit="ms", errors="coerce")
+            elif n >= 1_000_000_000:
+                parsed = pd.to_datetime(n, unit="s", errors="coerce")
+            else:
+                parsed = pd.to_datetime(n, errors="coerce")
+        except Exception:
+            return None
+        return None if pd.isna(parsed) else parsed.date()
+
+    s = safe_str(val)
+    if not s or s.lower() in {"nan", "nat", "none", "null", "1970-01-01"}:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        return parse_date_to_date(float(s))
+
+    parsed = pd.to_datetime(s, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    d = parsed.date()
+    return None if d.year <= 1970 else d
+
+
+def date_to_yyyy_mm_dd(val: Any) -> str:
+    d = parse_date_to_date(val)
+    return d.strftime("%Y-%m-%d") if d else ""
+
+
+def normalize_shortage_sku_list(value: Any) -> List[str]:
+    """把缺货 SKU 列表规整为去重后的 SKU 数组，供数量和写入共用。"""
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        s = safe_str(value)
+        if not s or s.lower() in {"nan", "none", "null"}:
+            return []
+        raw_items = re.split(r"[,，]", s)
+
+    seen = set()
+    result: List[str] = []
+    for item in raw_items:
+        sku_code = safe_str(item)
+        if not sku_code or sku_code.lower() in {"nan", "none", "null"}:
+            continue
+        if sku_code not in seen:
+            seen.add(sku_code)
+            result.append(sku_code)
+    return result
+
+
+def shortage_sku_count_from_list(value: Any) -> int:
+    return len(normalize_shortage_sku_list(value))
+
+
+def build_current_detail_for_summary(
+    items_df: pd.DataFrame,
+    reread_df: pd.DataFrame,
+    backfill_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """用本次加载的明细叠加本次计算结果，避免回填后重读延迟导致新增订单漏排。"""
+    source = items_df.copy() if items_df is not None else pd.DataFrame()
+    reread = reread_df.copy() if reread_df is not None else pd.DataFrame()
+    backfill = backfill_df.copy() if backfill_df is not None else pd.DataFrame()
+
+    for df in (source, reread, backfill):
+        if not df.empty and "_record_id" in df.columns:
+            df["_record_id"] = df["_record_id"].astype(str).apply(safe_str)
+
+    if reread.empty:
+        detail = source.copy()
+    else:
+        detail = reread.copy()
+        if not source.empty and "_record_id" in detail.columns and "_record_id" in source.columns:
+            existing_ids = set(detail["_record_id"].astype(str).apply(safe_str))
+            missing_source = source[~source["_record_id"].astype(str).apply(safe_str).isin(existing_ids)]
+            if not missing_source.empty:
+                print(f"⚠️ 回填后重读缺少 {len(missing_source)} 条本次明细，已用本次加载数据补齐")
+                detail = pd.concat([detail, missing_source], ignore_index=True, sort=False)
+
+    if detail.empty or backfill.empty or "_record_id" not in detail.columns or "_record_id" not in backfill.columns:
+        return detail
+
+    backfill_map = backfill.drop_duplicates(subset=["_record_id"], keep="last").set_index("_record_id")
+    overlay_cols = [c for c in backfill_map.columns if c != "_record_id"]
+    detail = detail.copy()
+    for col in overlay_cols:
+        if col not in detail.columns:
+            detail[col] = ""
+        detail[col] = detail.apply(
+            lambda r: backfill_map.at[safe_str(r.get("_record_id", "")), col]
+            if safe_str(r.get("_record_id", "")) in backfill_map.index
+            else r.get(col, ""),
+            axis=1,
+        )
+
+    return detail
+
+
+def has_valid_manual_confirm_date(row: Dict[str, Any]) -> bool:
+    return parse_date_to_date(row.get("人工确认发货时间")) is not None
+
+
+def is_effective_manual_confirmed(row: Dict[str, Any]) -> bool:
+    """只有明确人工确认且有有效人工确认发货时间，才按锁单处理。"""
+    return safe_str(row.get("是否人工确认", "")) == "是" and has_valid_manual_confirm_date(row)
 
 
 def calc_available_stock(inv_row: Optional[Dict[str, Any]], reserved_qty: float = 0.0) -> float:
@@ -751,19 +866,20 @@ def calc_shortage_eta_date(
     """
     match = sku_df[sku_df["产品编码SKU"] == sku_code] if (sku_df is not None and not sku_df.empty) else pd.DataFrame()
     if match.empty:
-        return base_date + timedelta(days=25)
-
-    sku_info = match.iloc[0].to_dict()
-    cycle = to_num(sku_info.get("标准生产周期", 0))
-    if cycle > 0:
-        return base_date + timedelta(days=int(cycle))
-
-    # 有SKU但没周期：如果能识别为“新产品”则 25天；否则也保守 25天（后续可细化）
-    is_new_combined = safe_str(sku_info.get("是否新产品是否自研是否外采", ""))
-    is_new_split = safe_str(sku_info.get("是否新产品", ""))
-    if "新" in is_new_combined or is_new_combined == "是" or is_new_split == "是":
-        return base_date + timedelta(days=25)
-    return base_date + timedelta(days=25)
+        cycle = 25
+        print("新产品，返回基准日+25天")
+    else:
+        sku_info = match.iloc[0].to_dict()
+        cycle = to_num(sku_info.get("标准生产周期", 0))
+        if cycle > 0:
+            print(f"有标准周期，返回基准日+{int(cycle)}天")
+        else:
+            cycle = 25
+            print("无标准周期，按新产品处理，返回基准日+25天")
+    
+    final_date = add_calendar_days_then_working_day(base_date, int(cycle))
+    print(f'物料 {sku_code}, 基准日 {base_date}, 标准周期 {cycle}天, 计算结果 {final_date}')
+    return final_date
 
 
 def calc_daily_capacity(sku_kinds: int, total_qty: float, base: int = 5) -> int:
@@ -800,10 +916,9 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
         return summary, 0
 
     df = summary.copy()
-    df["__ship_date"] = pd.to_datetime(df["AI建议发货时间"], errors="coerce").dt.date
-    df["__ship_date"] = df["__ship_date"].fillna(today)
+    df["__ship_date"] = df["AI建议发货时间"].apply(lambda x: next_working_day(parse_date_to_date(x) or today))
 
-    df["__locked"] = df.get("是否人工确认", "否").astype(str) == "是"
+    df["__locked"] = df.apply(lambda r: is_effective_manual_confirmed(r.to_dict()), axis=1)
     df["__special"] = df.get("项目类型", "").astype(str) == "特殊订单"
 
     # 只对“非锁定 + 非特殊”应用产能
@@ -820,7 +935,7 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
     assigned_dates = {}
 
     for _, row in normal.iterrows():
-        base_date = row["__ship_date"]
+        base_date = next_working_day(row["__ship_date"])
         order_sku_kinds = int(to_num(row.get("订单SKU总数", 0)))
         order_qty = to_num(row.get("订单总数量", 0))
 
@@ -841,14 +956,16 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
                     delayed += 1
                 break
 
-            d = d + timedelta(days=1)
+            d = next_working_day(d + timedelta(days=1))
 
     if assigned_dates:
-        normal["__ship_date_new"] = normal["合同编号"].astype(str).map(lambda x: assigned_dates.get(safe_str(x), today))
-        normal["AI建议发货时间"] = normal["__ship_date_new"].apply(lambda x: x.strftime("%Y-%m-%d") if isinstance(x, date) else "")
+        normal["__ship_date_new"] = normal["合同编号"].astype(str).map(lambda x: assigned_dates.get(safe_str(x), next_working_day(today)))
+        normal["AI建议发货时间"] = normal["__ship_date_new"].apply(date_to_yyyy_mm_dd)
         normal = normal.drop(columns=["__ship_date_new"])
 
     out = pd.concat([normal, others], ignore_index=True).drop(columns=["__ship_date", "__locked", "__special"], errors="ignore")
+    if "AI建议发货时间" in out.columns:
+        out["AI建议发货时间"] = out["AI建议发货时间"].apply(lambda x: date_to_yyyy_mm_dd(next_working_day(parse_date_to_date(x) or today)))
     # 输出表更友好：按新发货时间排序
     if "AI建议发货时间" in out.columns:
         out = out.sort_values(by=["AI建议发货时间", "合同编号"], kind="stable")
@@ -883,77 +1000,44 @@ def sku_supply_type_from_sku_row(sku_row: Dict[str, Any]) -> str:
     return ""
 
 
+def next_working_day(start_date: date) -> date:
+    """从 start_date 开始，找到下一个工作日（跳过周末）。"""
+    start_date = parse_date_to_date(start_date) or datetime.today().date()
+    if start_date.weekday() < 5:  # 周一到周五
+        return start_date
+    # 周六或周日，跳到下周一
+    days_to_add = 7 - start_date.weekday()
+    return start_date + timedelta(days=days_to_add)
+
+
+def add_calendar_days_then_working_day(start_date: date, days: int) -> date:
+    """先加自然日，再把结果顺延到工作日。"""
+    start_date = parse_date_to_date(start_date) or datetime.today().date()
+    return next_working_day(start_date + timedelta(days=int(days)))
+
+
 def calc_order_ship_date_for_group(
     group: pd.DataFrame,
     sku_df: pd.DataFrame,
     today: date,
-) -> date:
-    """按你给的规则2，计算“订单(合同编号)级别”的预计发货时间（返回日期）。"""
-    # ---- 规则1：订单类型判断（按顺序）----
-    # 远程控制项目（型号含 RB800）
-    any_rb800 = False
-    for _, r in group.iterrows():
-        if is_rb800_from_text(pick_model_text(r.to_dict())):
-            any_rb800 = True
-            break
-
-    # 特殊订单
-    is_urgent = (group.get("是否紧急订单", pd.Series(dtype=str)).astype(str) == "是").any()
-    is_exchange = (group.get("是否换货订单", pd.Series(dtype=str)).astype(str) == "是").any()
-    is_resend = (group.get("是否补发订单", pd.Series(dtype=str)).astype(str) == "是").any()
-    is_repair = (group.get("是否维修订单", pd.Series(dtype=str)).astype(str) == "是").any()
-
-    # ---- 缺货判定（来自明细回填后的库存状态）----
+) -> Tuple[Optional[date], Optional[date]]:
+    """计算订单级别的预计发货时间：返回 (latest_eta, ship_date)"""
     shortage_mask = group["库存状态"] == "缺货"
-    any_shortage = bool(shortage_mask.any())
-    all_in_stock = not any_shortage
+    shortage_rows = group[shortage_mask]
+    
+    if shortage_rows.empty:
+        # 无缺货，直接排到最近工作日
+        return None, next_working_day(today)
+    
+    valid_dates = [d for d in shortage_rows['预计到货日期'].apply(parse_date_to_date).tolist() if d is not None]
+    if valid_dates:
+        latest_eta = max(valid_dates)
+        ship_date = next_working_day(latest_eta)
+        return latest_eta, ship_date
 
-    # ---- 特殊订单优先规则（但注意你要求“规则1顺序”：先远控、再特殊、再常规）----
-    if any_rb800:
-        # 远程控制项目
-        if all_in_stock:
-            return today + timedelta(days=2)
-        # 有缺货：取缺货SKU最晚预计到货日期
-        # 预计到货日期已在明细回填时写入；这里取 max
-        eta_dates = pd.to_datetime(group.loc[shortage_mask, "预计到货日期"], errors="coerce").dt.date
-        latest_eta = eta_dates.max()
-        if pd.notna(latest_eta):
-            return latest_eta
-        # 若缺失，兜底：按 25 天
-        return today + timedelta(days=25)
-
-    if is_repair:
-        return today + timedelta(days=10)
-
-    if is_urgent or is_exchange or is_resend:
-        if all_in_stock:
-            return today + timedelta(days=1)
-        eta_dates = pd.to_datetime(group.loc[shortage_mask, "预计到货日期"], errors="coerce").dt.date
-        latest_eta = eta_dates.max()
-        if pd.notna(latest_eta):
-            return latest_eta
-        return today + timedelta(days=25)
-
-    # 常规项目
-    if all_in_stock:
-        return today + timedelta(days=2)
-
-    # 缺货：区分外采/自研（按缺货明细里的SKU属性，只要存在对应类型缺货就按该规则）
-    shortage_skus = group.loc[shortage_mask, "SKU编码"].astype(str).tolist()
-    types = set()
-    if sku_df is not None and not sku_df.empty:
-        for sc in shortage_skus:
-            m = sku_df[sku_df["产品编码SKU"] == sc]
-            if not m.empty:
-                types.add(sku_supply_type_from_sku_row(m.iloc[0].to_dict()))
-
-    if "外采" in types:
-        return today + timedelta(days=5)
-    if "自研" in types:
-        return today + timedelta(days=3)
-
-    # 暂无法区分：保守按外采 5天
-    return today + timedelta(days=5)
+    # 缺货但暂时没有有效 ETA 时也必须进入 AI排单总表，避免新增订单被漏排。
+    fallback_eta = add_calendar_days_then_working_day(today, 25)
+    return fallback_eta, fallback_eta
 
 # =========================
 # 主排单API
@@ -1000,17 +1084,26 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     if not old_summary.empty:
         if "合同编号" not in old_summary.columns and "AI订单ID" in old_summary.columns:
             old_summary = old_summary.rename(columns={"AI订单ID": "合同编号"})
+        if "合同编号" in old_summary.columns:
+            old_summary["合同编号"] = old_summary["合同编号"].astype(str).apply(safe_str)
         if "是否人工确认" not in old_summary.columns:
             old_summary["是否人工确认"] = "否"
         if "人工确认发货时间" not in old_summary.columns:
             old_summary["人工确认发货时间"] = ""
+        old_summary["是否人工确认"] = old_summary.apply(
+            lambda r: "是" if is_effective_manual_confirmed(r.to_dict()) else "否",
+            axis=1,
+        )
+        if "AI建议发货时间" in old_summary.columns:
+            old_summary["AI建议发货时间"] = old_summary["AI建议发货时间"].apply(date_to_yyyy_mm_dd)
+        old_summary["人工确认发货时间"] = old_summary["人工确认发货时间"].apply(date_to_yyyy_mm_dd)
     # =========================
     # 计算已锁单库存占用（关键AI逻辑）
     # =========================
     locked_stock: Dict[str, float] = {}
 
     if not old_summary.empty:
-        locked_orders = old_summary[old_summary["是否人工确认"] == "是"]
+        locked_orders = old_summary[old_summary.apply(lambda r: is_effective_manual_confirmed(r.to_dict()), axis=1)]
 
         if not locked_orders.empty:
             try:
@@ -1045,6 +1138,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             inv_latest_date = inv_dt.max().date()
     except Exception:
         pass
+    stock_base_date = max(today, inv_latest_date)
     backfill_rows = []
 
     for _, row in items.iterrows():
@@ -1059,8 +1153,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         if inv_info is None:
             print(f"⚠️ 库存未匹配 合同={contract_id} SKU={sku_code} 规格={safe_str(row_dict.get('规格', ''))[:50]} → {_inv_how}")
 
-        # 以当前系统运行日期作为 ETA 基准日
-        stock_base_date = today
+        # 以库存快照最新日期或今天作为 ETA 基准日
 
         reserved = locked_stock.get(sku_code, 0.0)
         available = calc_available_stock(inv_info, reserved_qty=reserved)
@@ -1099,11 +1192,23 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     # 第二步开始前：重新读取“已回填”的销售订单明细表
     # =========================
     print("正在重新读取回填后的销售订单明细表...")
-    df_detail = fetch_bitable_to_df(TABLE_ID_ITEMS)
+    df_detail_reread = fetch_bitable_to_df(TABLE_ID_ITEMS)
+    df_detail = build_current_detail_for_summary(items, df_detail_reread, df_backfill)
     # 统一关键列类型
-    df_detail["合同数量"] = df_detail.get("合同数量", 0).apply(to_num)
-    df_detail["库存可用量"] = df_detail.get("库存可用量", 0).apply(to_num)
-    df_detail["缺口数量"] = df_detail.get("缺口数量", 0).apply(to_num)
+    for required_col in ("合同编号", "SKU编码", "合同数量", "库存可用量", "缺口数量"):
+        if required_col not in df_detail.columns:
+            df_detail[required_col] = ""
+    df_detail["合同编号"] = df_detail["合同编号"].astype(str).apply(safe_str)
+    df_detail["SKU编码"] = df_detail["SKU编码"].astype(str).apply(safe_str)
+    df_detail = df_detail[(df_detail["合同编号"] != "") & (df_detail["SKU编码"] != "")]
+    df_detail["合同数量"] = df_detail["合同数量"].apply(to_num)
+    df_detail["库存可用量"] = df_detail["库存可用量"].apply(to_num)
+    df_detail["缺口数量"] = df_detail["缺口数量"].apply(to_num)
+    if "库存状态" not in df_detail.columns:
+        df_detail["库存状态"] = ""
+    df_detail["库存状态"] = df_detail["库存状态"].astype(str).apply(safe_str)
+    if "预计到货日期" not in df_detail.columns:
+        df_detail["预计到货日期"] = ""
 
     # 本地缓存明细（用于下次锁单占用）
     try:
@@ -1112,6 +1217,8 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         print("⚠️ 明细缓存保存失败：", str(e))
 
     # ===== 第二步：生成“AI排单总表”（按合同汇总，一单一行） =====
+    print('明细表列名:', df_detail.columns.tolist())
+    print(df_detail[['合同编号', 'SKU编码', '库存状态', '预计到货日期']].head(3))
     summary_rows = []
     if not df_detail.empty:
         def safe_val(x):
@@ -1129,12 +1236,16 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 old_row = old_summary[old_summary["合同编号"] == contract_id]
 
                 if not old_row.empty:
-                    if old_row.iloc[0]["是否人工确认"] == "是":
+                    if is_effective_manual_confirmed(old_row.iloc[0].to_dict()):
                         print(f"🔒 合同 {contract_id} 已人工锁单，跳过AI重算")
                         summary_rows.append(old_row.iloc[0].to_dict())
                         continue
 
-            ship_date = calc_order_ship_date_for_group(group=group, sku_df=sku, today=today)
+            latest_eta, ship_date = calc_order_ship_date_for_group(group=group, sku_df=sku, today=today)
+            if ship_date is None:
+                ship_date = next_working_day(today)
+                print(f'⚠️ 订单 {contract_id} 暂无有效发货日期，已兜底排到最近工作日 {ship_date}')
+            print(f'订单 {contract_id}: latest_eta={latest_eta}, ship_date={ship_date}')
 
             # 订单类型（用于输出字段 `项目类型`）
             # 与规则1一致：远控 / 特殊 / 常规
@@ -1155,11 +1266,13 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             else:
                 project_type = "常规项目"
 
-            sku_count = safe_val(group["SKU编码"].nunique())
+            sku_codes = group["SKU编码"].astype(str).apply(safe_str)
+            sku_count = safe_val(sku_codes.nunique())
             total_qty = safe_val(group["合同数量"].sum())
             shortage_mask = group["库存状态"] == "缺货"
-            shortage_sku_count = safe_val(shortage_mask.sum())
-            shortage_sku_list = group.loc[shortage_mask, "SKU编码"].unique().tolist()
+            shortage_rows = group[shortage_mask]
+            shortage_skus_unique = sorted(normalize_shortage_sku_list(shortage_rows['SKU编码'].dropna().unique().tolist()))
+            shortage_sku_count = len(shortage_skus_unique)
             overall_status = "缺货" if shortage_sku_count else "有货"
 
             summary_rows.append({
@@ -1167,15 +1280,19 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 "项目类型": project_type,
                 "订单SKU总数": sku_count if sku_count is not None else 0,
                 "订单总数量": total_qty if total_qty is not None else 0,
-                "缺货SKU数": shortage_sku_count if shortage_sku_count is not None else 0,
-                "缺货SKU列表": ", ".join(shortage_sku_list) if shortage_sku_list else "",
+                "缺货SKU数": shortage_sku_count,
+                "缺货SKU列表": ', '.join(shortage_skus_unique),
                 "整体状态": overall_status,
-                "AI建议发货时间": ship_date.strftime("%Y-%m-%d") if ship_date else "",
+                "AI建议发货时间": date_to_yyyy_mm_dd(next_working_day(ship_date)) if ship_date else "",
                 "排单批次号": batch_id,
                 "是否人工确认": "否",
                 "人工确认发货时间": ""
             })
     summary = pd.DataFrame(summary_rows)
+    # 统一合同编号，避免同一合同因空格/格式差异被重复写入
+    if not summary.empty:
+        summary["合同编号"] = summary["合同编号"].astype(str).apply(safe_str)
+        summary = summary.drop_duplicates(subset=["合同编号"], keep="last")
     print("summary 列名：", list(summary.columns))
 
     # ===== 第三步：应用每日产能限制（仅非锁单/非特殊订单）=====
@@ -1192,40 +1309,35 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             elif key == "项目类型":
                 converted[key] = str(value) if value is not None else ""
             elif key == "订单SKU总数":
-                converted[key] = int(value) if value is not None and value != "" else 0
+                converted[key] = int(to_num(value)) if value is not None and value != "" else 0
             elif key == "订单总数量":
-                converted[key] = int(value) if value is not None and value != "" else 0
+                converted[key] = int(to_num(value)) if value is not None and value != "" else 0
             elif key == "缺货SKU数":
-                converted[key] = int(value) if value is not None and value != "" else 0
+                converted[key] = int(to_num(value)) if value is not None and value != "" else 0
             elif key == "缺货SKU列表":
-                converted[key] = str(value) if value is not None else ""
+                converted[key] = ", ".join(normalize_shortage_sku_list(value))
             elif key == "整体状态":
                 converted[key] = str(value) if value is not None else ""
             elif key == "AI建议发货时间":
-                if value is not None and value != "":
-                    if isinstance(value, str):
-                        converted[key] = value  # 已经是 'YYYY-MM-DD'
-                    elif isinstance(value, date):
-                        converted[key] = value.strftime("%Y-%m-%d")
-                    else:
-                        # 跳过
-                        pass
-                # else 跳过不写入
+                converted[key] = date_to_yyyy_mm_dd(next_working_day(parse_date_to_date(value) or datetime.today().date()))
             elif key == "排单批次号":
                 converted[key] = str(value) if value is not None else ""
             elif key == "是否人工确认":
-                bool_val = bool(value) if value is not None else False
-                converted[key] = "是" if bool_val else "否"
+                converted[key] = "是" if safe_str(value) == "是" else "否"
             elif key == "人工确认发货时间":
-                converted[key] = str(value) if value is not None else ""
+                converted[key] = date_to_yyyy_mm_dd(value)
             else:
                 converted[key] = value
+        converted["缺货SKU列表"] = ", ".join(normalize_shortage_sku_list(converted.get("缺货SKU列表", "")))
+        converted["缺货SKU数"] = shortage_sku_count_from_list(converted.get("缺货SKU列表", ""))
+        converted["是否人工确认"] = "是" if is_effective_manual_confirmed(converted) else "否"
         return converted
 
     converted_summary_rows = []
     for _, row in summary.iterrows():
         converted_row = convert_summary_row(row.to_dict())
-        print(f"转换后数据类型和值: { {k: (type(v).__name__, v) for k, v in converted_row.items()} }")
+        if converted_row.get("合同编号") == "GW20260410-3":
+            print(f"GW20260410-3 转换后数据: {converted_row}")
         converted_summary_rows.append(converted_row)
 
     summary = pd.DataFrame(converted_summary_rows)
@@ -1253,6 +1365,8 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         summary,
         key_col="合同编号",
         key_field_name="合同编号",
+        numeric_cols=SUMMARY_NUMERIC_COLS_DEFAULT,
+        date_cols=SUMMARY_DATE_COLS_DEFAULT,
     )
 
     if upsert_err:
@@ -1302,4 +1416,4 @@ if __name__ == "__main__":
     import uvicorn
 
     print("启动AI排单服务...")
-    uvicorn.run("scheduler_api:app", host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
