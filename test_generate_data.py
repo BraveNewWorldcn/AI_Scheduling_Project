@@ -1,12 +1,15 @@
 """生成测试数据并写入飞书——只新增，不修改/删除任何已有记录。"""
-import httpx, json, time, sys, random
+import httpx, json, time, sys, random, os
 from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-APP_ID = 'cli_a96c5d017d3a1cbb'
-APP_SECRET = 'Bk7RzLFMmeVfsERXIoazcbyXKzRm7fE5'
-APP_TOKEN = 'C5JzbAfnia0nT3sRvjucXgUGnDc'
+APP_ID = os.getenv("FEISHU_APP_ID", "cli_a96c5d017d3a1cbb")
+APP_SECRET = os.getenv("FEISHU_APP_SECRET")
+APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "C5JzbAfnia0nT3sRvjucXgUGnDc")
+
+if not APP_SECRET:
+    raise ValueError("请先设置环境变量 FEISHU_APP_SECRET")
 
 # ---------- 获取 token ----------
 resp = httpx.post('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',

@@ -1,8 +1,13 @@
 from openai import OpenAI
 import json
+import os
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    raise ValueError("请先设置环境变量 DEEPSEEK_API_KEY")
 
 client = OpenAI(
-    api_key="sk-8094ca0c922d422c9add026614a78dcd",
+    api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
 )
 

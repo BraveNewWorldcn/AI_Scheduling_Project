@@ -69,9 +69,9 @@ def parse_feishu_field(value):
         return str(value).strip()
 
 # ========== 飞书配置 ==========
-FEISHU_APP_ID = "cli_a96c5d017d3a1cbb"
-FEISHU_APP_SECRET = "Bk7RzLFMmeVfsERXIoazcbyXKzRm7fE5"
-BITABLE_APP_TOKEN = "C5JzbAfnia0nT3sRvjucXgUGnDc"
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "cli_a96c5d017d3a1cbb")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "Bk7RzLFMmeVfsERXIoazcbyXKzRm7fE5")
+BITABLE_APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "C5JzbAfnia0nT3sRvjucXgUGnDc")
 
 # ===== 数据表 ID 配置 =====
 TABLE_ID_ITEMS = "tblJn5iP6imjzE8h"                   # 销售订单明细表 ID（必需）
@@ -1480,6 +1480,7 @@ td:first-child{font-family:monospace;font-weight:600;width:100px}
     <h3>API 接口</h3>
     <table>
       <tr><td><span class="badge badge-post">POST</span></td><td>/schedule</td><td>手动触发排单</td></tr>
+      <tr><td><span class="badge badge-get">GET</span></td><td>/daily-report</td><td>获取今日排单日报</td></tr>
       <tr><td><span class="badge badge-post">POST</span></td><td>/webhook/feishu</td><td>飞书 Webhook 回调</td></tr>
       <tr><td><span class="badge badge-get">GET</span></td><td>/</td><td>操作面板</td></tr>
       <tr><td><span class="badge badge-get">GET</span></td><td>/docs</td><td>API JSON 参考</td></tr>
@@ -1789,6 +1790,97 @@ def generate_daily_report(
         "未来3天缺货订单数": str(f3_short),
         "未来7天应发货订单数": str(f7_ship),
     }
+    return report
+
+
+# =========================
+# 读取今日排单日报（供外部机器人/通知消费）
+# =========================
+
+def get_today_report_row() -> dict:
+    """读取 AI排单日报表 中最新的那一行，并校验是否为今日数据。
+
+    三个核心安全策略：
+    1. 倒序取 Top 1 —— sort 按"排单运行时间"降序，page_size=1，永远只抓最新行
+    2. 今日数据校验锁 —— 如果最新行不是今天的，说明上游排单系统可能挂了没写数据
+    3. 安全容错提取 —— 所有字段用 .get() 赋默认值，空单元格不会导致 KeyError 崩溃
+    """
+    headers = _feishu_headers()
+    url = f"{FEISHU_BITABLE_BASE}/tables/{TABLE_ID_DAILY_REPORT}/records/search"
+
+    payload = {
+        "page_size": 1,
+        "sort": [
+            {"field_name": "排单运行时间", "desc": True}
+        ]
+    }
+
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+        data = resp.json()
+    except Exception as e:
+        raise Exception(f"读取日报表网络请求失败: {e}")
+
+    if data.get("code") != 0:
+        raise Exception(f"读取日报表失败: code={data.get('code')}, msg={data.get('msg')}")
+
+    items = data.get("data", {}).get("items", [])
+    if not items:
+        raise ValueError("飞书日报表为空，没有找到任何排单日报数据。")
+
+    record = items[0]["fields"]
+
+    # ===== 今日数据校验锁 =====
+    # 供应链业务铁律：宁可不发报表，也绝不能发错报表。
+    # 如果前置排单系统挂了没写数据，这里会识别出最新行是昨天的旧数据。
+    CST = timezone(timedelta(hours=8))
+    today_str = datetime.now(CST).strftime("%Y-%m-%d")
+
+    # 飞书日期字段可能是毫秒时间戳，也可能是字符串，统一尝试转换
+    record_date_str = ""
+    raw_date = record.get("日期")
+    if raw_date is not None:
+        if isinstance(raw_date, (int, float)) and raw_date > 0:
+            try:
+                if raw_date >= 10_000_000_000:
+                    record_date_str = datetime.fromtimestamp(raw_date / 1000, tz=CST).strftime("%Y-%m-%d")
+                elif raw_date >= 1_000_000_000:
+                    record_date_str = datetime.fromtimestamp(raw_date, tz=CST).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        if not record_date_str:
+            record_date_str = str(raw_date).strip()
+
+    if today_str not in str(record_date_str):
+        print(
+            f"[日报校验] 获取到的最新数据日期为 [{record_date_str}]，"
+            f"不是今日 [{today_str}]。"
+            f"可能排单脚本今日未运行或运行失败，请立即排查！"
+        )
+        # 供应链场景：宁可中断，不发旧数据。取消下面这行注释即可启用硬阻断：
+        # raise ValueError(f"日报数据过期：最新数据日期为 {record_date_str}，非今日 {today_str}。排单脚本可能未运行。")
+
+    # ===== 安全容错提取 =====
+    # 全部使用 .get(key, default)，空单元格自动补 0 或合理默认值，程序像坦克一样稳定推进
+    report = {
+        "排单批次号":       str(record.get("排单批次号", "未知批次") or "未知批次"),
+        "订单总数":         str(record.get("订单总数", 0) or 0),
+        "今日新增订单":     str(record.get("今日新增订单", 0) or 0),
+        "今日紧急订单":     str(record.get("今日紧急订单", 0) or 0),
+        "未排单订单数":     str(record.get("未排单订单数", 0) or 0),
+        "已排单订单数":     str(record.get("已排单订单数", 0) or 0),
+        "人工已确认排单数": str(record.get("人工已确认排单数", 0) or 0),
+        "今日应发货订单数": str(record.get("今日应发货订单数", 0) or 0),
+        "今日可发货订单数": str(record.get("今日可发货订单数", 0) or 0),
+        "今日预计延迟订单数": str(record.get("今日预计延迟订单数", 0) or 0),
+        "库存缺货SKU数":    str(record.get("库存缺货SKU数", 0) or 0),
+        "最紧缺SKU":        str(record.get("最紧缺SKU", "无") or "无"),
+        "最紧缺SKU缺口":    str(record.get("最紧缺SKU缺口", 0) or 0),
+        "未来3天缺货订单数": str(record.get("未来3天缺货订单数", 0) or 0),
+        "日期":             str(record.get("日期", today_str) or today_str),
+        "排单运行时间":     str(record.get("排单运行时间", "") or ""),
+    }
+
     return report
 
 
@@ -2261,7 +2353,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         try:
             print("正在生成 AI排单日报...")
             report = generate_daily_report(
-                items_df=items,
+                items_df=df_detail,
                 summary_df=summary,
                 inv_df=inv,
                 sku_df=sku,
@@ -2312,6 +2404,24 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         "elapsed_s": round(elapsed, 1),
         "notes": "回填已更新销售订单明细表原记录；总表按合同编号更新/新增；AI仅生成待确认；库存预留已按待确认订单刷新"
     }
+
+
+# =========================
+# 日报查询 API
+# =========================
+@app.get("/daily-report")
+def daily_report():
+    """获取今日最新排单日报数据（读 AI排单日报表，含今日数据校验）。"""
+    try:
+        report = get_today_report_row()
+        return {
+            "msg": "日报获取成功",
+            "report": report
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": f"日报获取失败: {e}"}
 
 
 # =========================
