@@ -68,38 +68,44 @@ def parse_feishu_field(value):
     else:
         return str(value).strip()
 
+# ----- 自动加载 .env 文件 -----
+def _load_dotenv():
+    """从项目目录的 .env 文件加载环境变量（不覆盖已设置的系统环境变量）。"""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
 # ========== 飞书配置 ==========
-FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "cli_a96c5d017d3a1cbb")
-FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "Bk7RzLFMmeVfsERXIoazcbyXKzRm7fE5")
-BITABLE_APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "C5JzbAfnia0nT3sRvjucXgUGnDc")
+# 所有部署相关配置一律从环境变量读取，值定义在项目 .env 文件中。
+# 代码中不保留任何真实值作为默认值。
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET")
+BITABLE_APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "")
+
+if not FEISHU_APP_SECRET:
+    raise ValueError("请先设置环境变量 FEISHU_APP_SECRET（或在项目 .env 文件中配置）")
 
 # ===== 数据表 ID 配置 =====
-TABLE_ID_ITEMS = "tblJn5iP6imjzE8h"                   # 销售订单明细表 ID（必需）
-TABLE_ID_SKU   = "tblVAGWeGHvmbFgJ"                   # SKU标准表 ID（必需）
-TABLE_ID_INV   = "tblFZNdEwW50izjh"                   # 库存快照表 ID（必需）
-TABLE_ID_DETAIL = "tbl09Z6C7wCGh3mW"                  # AI排单总表（输出）
-TABLE_ID_RESERVATION = "tblDD1jL8bcEvm2L"             # AI排单_库存预留表 ID（必需）
-TABLE_ID_MAIN = "tbl06oxGEdMNTEB8"                    # 销售订单主表 ID（客户名称/项目名称来源）
-TABLE_ID_SHIPPING = "tblcphwXychzkB9S"                  # AI发货总表 ID（输出）
-TABLE_ID_DAILY_REPORT = "tblF0dgaoF3B60Ng"             # AI排单日报表 ID（输出）
-
-# 环境变量优先于上方默认值
-if os.getenv("TABLE_ID_ITEMS"):
-    TABLE_ID_ITEMS = os.getenv("TABLE_ID_ITEMS").strip()
-if os.getenv("TABLE_ID_SKU"):
-    TABLE_ID_SKU = os.getenv("TABLE_ID_SKU").strip()
-if os.getenv("TABLE_ID_INV"):
-    TABLE_ID_INV = os.getenv("TABLE_ID_INV").strip()
-if os.getenv("TABLE_ID_DETAIL"):
-    TABLE_ID_DETAIL = os.getenv("TABLE_ID_DETAIL").strip()
-if os.getenv("TABLE_ID_RESERVATION"):
-    TABLE_ID_RESERVATION = os.getenv("TABLE_ID_RESERVATION").strip()
-if os.getenv("TABLE_ID_MAIN"):
-    TABLE_ID_MAIN = os.getenv("TABLE_ID_MAIN").strip()
-if os.getenv("TABLE_ID_SHIPPING"):
-    TABLE_ID_SHIPPING = os.getenv("TABLE_ID_SHIPPING").strip()
-if os.getenv("TABLE_ID_DAILY_REPORT"):
-    TABLE_ID_DAILY_REPORT = os.getenv("TABLE_ID_DAILY_REPORT").strip()
+TABLE_ID_ITEMS = os.getenv("TABLE_ID_ITEMS", "")
+TABLE_ID_SKU   = os.getenv("TABLE_ID_SKU", "")
+TABLE_ID_INV   = os.getenv("TABLE_ID_INV", "")
+TABLE_ID_DETAIL = os.getenv("TABLE_ID_DETAIL", "")
+TABLE_ID_RESERVATION = os.getenv("TABLE_ID_RESERVATION", "")
+TABLE_ID_MAIN = os.getenv("TABLE_ID_MAIN", "")
+TABLE_ID_SHIPPING = os.getenv("TABLE_ID_SHIPPING", "")
+TABLE_ID_DAILY_REPORT = os.getenv("TABLE_ID_DAILY_REPORT", "")
 
 # ===== 输出表字段映射 =====
 OUTPUT_SUMMARY_FIELDS_MAP = {
@@ -168,13 +174,31 @@ def get_access_token() -> str:
             "app_id": FEISHU_APP_ID,
             "app_secret": FEISHU_APP_SECRET
         }, timeout=30.0)
-        data = resp.json()
+        data = _safe_http_json(resp, "获取飞书Token")
         if data.get("code") != 0:
             raise Exception(f"获取飞书token失败: {data}")
 
         _token_cache["token"] = data["tenant_access_token"]
         _token_cache["expires_at"] = now + data.get("expire", 7200)
         return _token_cache["token"]
+
+
+def _safe_http_json(resp, context: str = "") -> dict:
+    """安全解析 HTTP 响应 JSON。非 JSON 响应（如 HTML 错误页）会给出可读的错误信息。"""
+    content_type = resp.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        preview = resp.text[:500] if resp.text else "(empty body)"
+        raise Exception(
+            f"{context} 飞书接口返回非JSON响应 "
+            f"(HTTP {resp.status_code}, Content-Type={content_type}): {preview}"
+        )
+    try:
+        return resp.json()
+    except Exception as e:
+        preview = resp.text[:500] if resp.text else "(empty body)"
+        raise Exception(
+            f"{context} JSON解析失败 (HTTP {resp.status_code}): {preview}"
+        ) from e
 
 
 def _feishu_headers() -> Dict[str, str]:
@@ -200,7 +224,7 @@ def _fetch_table_records(table_id: str) -> List[Dict[str, Any]]:
             params["page_token"] = page_token
 
         resp = httpx.get(url, headers=headers, params=params, timeout=30.0)
-        data = resp.json()
+        data = _safe_http_json(resp, "飞书读取表格")
         if data.get("code") != 0:
             raise Exception(f"飞书读取表格失败: {data}")
 
@@ -673,7 +697,7 @@ def _post_batch(url: str, headers: Dict[str, str], records: List[Dict[str, Any]]
     """发送一批记录到飞书批量 API。"""
     try:
         resp = httpx.post(url, headers=headers, json={"records": records}, timeout=60.0)
-        data = resp.json()
+        data = _safe_http_json(resp, f"批量{action}")
         if data.get("code") != 0:
             print(f"批量{action}失败: {data}")
         else:
@@ -1051,12 +1075,14 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
         order_qty = to_num(row.get("订单总数量", 0))
         contract_id = safe_str(row.get("合同编号", ""))
 
-        # 路径压缩：跳过所有已满日期
+        # 路径压缩：跳过所有已满日期（防死循环：最多检查 365 天）
         d = base_date
         visited: List[date] = []
-        while d in overflow:
+        _safety = 0
+        while d in overflow and _safety < 365:
             visited.append(d)
             d = overflow[d]
+            _safety += 1
         # 路径压缩：visited 中的所有日期直接指向 d
         for v in visited:
             overflow[v] = d
@@ -1076,9 +1102,11 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
             sk = day_sku_kinds.get(d, 0)
             tq = day_total_qty.get(d, 0)
             cap = calc_daily_capacity(sk, tq, base=5)
-            # 最多再检查一次；如果连续满则走压缩路径
-            while d in overflow:
+            # 最多再检查一次；如果连续满则走压缩路径（防死循环）
+            _safety2 = 0
+            while d in overflow and _safety2 < 365:
                 d = overflow[d]
+                _safety2 += 1
                 c = day_count.get(d, 0)
                 sk = day_sku_kinds.get(d, 0)
                 tq = day_total_qty.get(d, 0)
@@ -1781,7 +1809,7 @@ def generate_daily_report(
         "库存充足SKU数": str(sufficient),
         "库存预警SKU数": str(warning),
         "库存缺货SKU数": str(shortage),
-        "最紧缺SKU": _fmt_shortage_sku(shortage_order_skus, sku_name_map, sku_unit_map),
+        "最紧缺SKU": _fmt_shortage_sku(shortage_order_skus[:1], sku_name_map, sku_unit_map),
         "最紧缺SKU缺口": str(int(gap_max)) if gap_max == int(gap_max) else str(round(gap_max, 1)),
         "最长交期订单": max_lead_contract,
         "最晚发货日期": latest_ship_date,
@@ -1817,7 +1845,7 @@ def get_today_report_row() -> dict:
 
     try:
         resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
-        data = resp.json()
+        data = _safe_http_json(resp, "读取日报表")
     except Exception as e:
         raise Exception(f"读取日报表网络请求失败: {e}")
 
@@ -1861,27 +1889,47 @@ def get_today_report_row() -> dict:
         # raise ValueError(f"日报数据过期：最新数据日期为 {record_date_str}，非今日 {today_str}。排单脚本可能未运行。")
 
     # ===== 安全容错提取 =====
-    # 全部使用 .get(key, default)，空单元格自动补 0 或合理默认值，程序像坦克一样稳定推进
+    # 飞书 API 返回的字段值是富文本数组格式 [{"text":"...","type":"text"}]，
+    # 必须用 parse_feishu_field() 清洗为纯文本，不能直接 str()。
     report = {
-        "排单批次号":       str(record.get("排单批次号", "未知批次") or "未知批次"),
-        "订单总数":         str(record.get("订单总数", 0) or 0),
-        "今日新增订单":     str(record.get("今日新增订单", 0) or 0),
-        "今日紧急订单":     str(record.get("今日紧急订单", 0) or 0),
-        "未排单订单数":     str(record.get("未排单订单数", 0) or 0),
-        "已排单订单数":     str(record.get("已排单订单数", 0) or 0),
-        "人工已确认排单数": str(record.get("人工已确认排单数", 0) or 0),
-        "今日应发货订单数": str(record.get("今日应发货订单数", 0) or 0),
-        "今日可发货订单数": str(record.get("今日可发货订单数", 0) or 0),
-        "今日预计延迟订单数": str(record.get("今日预计延迟订单数", 0) or 0),
-        "库存缺货SKU数":    str(record.get("库存缺货SKU数", 0) or 0),
-        "最紧缺SKU":        str(record.get("最紧缺SKU", "无") or "无"),
-        "最紧缺SKU缺口":    str(record.get("最紧缺SKU缺口", 0) or 0),
-        "未来3天缺货订单数": str(record.get("未来3天缺货订单数", 0) or 0),
-        "日期":             str(record.get("日期", today_str) or today_str),
-        "排单运行时间":     str(record.get("排单运行时间", "") or ""),
+        "排单批次号":       parse_feishu_field(record.get("排单批次号")) or "未知批次",
+        "订单总数":         parse_feishu_field(record.get("订单总数")) or "0",
+        "今日新增订单":     parse_feishu_field(record.get("今日新增订单")) or "0",
+        "今日紧急订单":     parse_feishu_field(record.get("今日紧急订单")) or "0",
+        "未排单订单数":     parse_feishu_field(record.get("未排单订单数")) or "0",
+        "已排单订单数":     parse_feishu_field(record.get("已排单订单数")) or "0",
+        "人工已确认排单数": parse_feishu_field(record.get("人工已确认排单数")) or "0",
+        "今日应发货订单数": parse_feishu_field(record.get("今日应发货订单数")) or "0",
+        "今日可发货订单数": parse_feishu_field(record.get("今日可发货订单数")) or "0",
+        "今日预计延迟订单数": parse_feishu_field(record.get("今日预计延迟订单数")) or "0",
+        "库存缺货SKU数":    parse_feishu_field(record.get("库存缺货SKU数")) or "0",
+        "最紧缺SKU":        parse_feishu_field(record.get("最紧缺SKU")) or "无",
+        "最紧缺SKU缺口":    parse_feishu_field(record.get("最紧缺SKU缺口")) or "0",
+        "未来3天缺货订单数": parse_feishu_field(record.get("未来3天缺货订单数")) or "0",
+        "日期":             record_date_str or today_str,
+        "排单运行时间":     parse_feishu_field(record.get("排单运行时间")) or "",
     }
 
     return report
+
+
+def dispatch_schedule_notifications(report: dict) -> dict:
+    """排单完成后触发飞书三线机器人通知，失败不阻断排单主流程。"""
+    if not report:
+        return {"enabled": False, "ok": False, "error": "日报为空，未触发通知"}
+    try:
+        from ai_daily_agent import execute_triple_track_dispatch
+
+        ok = execute_triple_track_dispatch(report)
+        return {
+            "enabled": True,
+            "ok": bool(ok),
+            "error": "" if ok else "一个或多个飞书 webhook 发送失败，请查看服务日志",
+        }
+    except SystemExit as e:
+        return {"enabled": True, "ok": False, "error": f"通知模块配置缺失: {e}"}
+    except Exception as e:
+        return {"enabled": True, "ok": False, "error": str(e)}
 
 
 # =========================
@@ -2205,15 +2253,20 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             tasks.append((idx, order_info))
 
         ai_results: Dict[int, tuple] = {}
+        total_tasks = len(tasks)
+        completed = 0
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ai_risk") as executor:
             futures = {executor.submit(analyze_order_risk, t[1]): t[0] for t in tasks}
             for future in as_completed(futures):
                 row_idx = futures[future]
                 try:
-                    result = future.result()
+                    result = future.result(timeout=60)
                     ai_results[row_idx] = (str(result.get("risk", "")), str(result.get("advice", "")))
+                    completed += 1
+                    print(f"  AI分析进度: {completed}/{total_tasks}")
                 except Exception as e:
-                    print(f"  AI分析失败 行{row_idx}: {e}")
+                    completed += 1
+                    print(f"  AI分析失败 行{row_idx} ({completed}/{total_tasks}): {e}")
                     ai_results[row_idx] = ("", "")
 
         ai_risks, ai_advices = [], []
@@ -2349,6 +2402,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
     # ===== 生成 AI排单日报 =====
     daily_report_written = 0
+    notification_result = {"enabled": False, "ok": False, "error": "未生成日报，未触发通知"}
     if TABLE_ID_DAILY_REPORT:
         try:
             print("正在生成 AI排单日报...")
@@ -2368,6 +2422,12 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 )
                 daily_report_written = 1
                 print("AI排单日报生成完成")
+                print("正在触发飞书三线机器人通知...")
+                notification_result = dispatch_schedule_notifications(report)
+                if notification_result.get("ok"):
+                    print("飞书三线机器人通知已触发")
+                else:
+                    print(f"飞书三线机器人通知失败(不影响排单): {notification_result.get('error')}")
         except Exception as e:
             print(f"AI排单日报生成失败(不影响排单): {e}")
     else:
@@ -2386,6 +2446,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             "顺延订单数": int(delayed_cnt),
             "发货总表写入行数": shipping_written,
             "日报写入": daily_report_written,
+            "飞书通知": notification_result,
             "TABLE_ID_DETAIL": TABLE_ID_DETAIL,
             "elapsed_s": round(elapsed, 1),
             "notes": "请核对多维表格中「AI排单总表」的真实 table_id（应以 tbl 开头），或通过环境变量 TABLE_ID_DETAIL 覆盖。",
@@ -2400,6 +2461,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         "预留释放行数": int(released_count),
         "发货总表写入行数": shipping_written,
         "日报写入": daily_report_written,
+        "飞书通知": notification_result,
         "批次号": batch_id,
         "elapsed_s": round(elapsed, 1),
         "notes": "回填已更新销售订单明细表原记录；总表按合同编号更新/新增；AI仅生成待确认；库存预留已按待确认订单刷新"

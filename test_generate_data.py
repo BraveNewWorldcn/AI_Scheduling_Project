@@ -4,12 +4,35 @@ from datetime import datetime, timedelta
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-APP_ID = os.getenv("FEISHU_APP_ID", "cli_a96c5d017d3a1cbb")
+# ----- 自动加载 .env 文件 -----
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
+
+APP_ID = os.getenv("FEISHU_APP_ID", "")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET")
-APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "C5JzbAfnia0nT3sRvjucXgUGnDc")
+APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "")
+
+TABLE_ID_SKU = os.getenv("TABLE_ID_SKU", "")
+TABLE_ID_MAIN = os.getenv("TABLE_ID_MAIN", "")
+TABLE_ID_INV = os.getenv("TABLE_ID_INV", "")
+TABLE_ID_ITEMS = os.getenv("TABLE_ID_ITEMS", "")
 
 if not APP_SECRET:
-    raise ValueError("请先设置环境变量 FEISHU_APP_SECRET")
+    raise ValueError("请先设置环境变量 FEISHU_APP_SECRET（或在项目 .env 文件中配置）")
 
 # ---------- 获取 token ----------
 resp = httpx.post('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
@@ -93,7 +116,7 @@ for i in range(1, 31):
         '是否外采': '是' if i % 3 == 0 else '否',
     })
 
-write_records('tblVAGWeGHvmbFgJ', skus, 'SKU标准表')
+write_records(TABLE_ID_SKU, skus, 'SKU标准表')
 time.sleep(0.5)
 
 # ====== 2. 销售订单主表 (15 个 TEST_ 合同) ======
@@ -144,7 +167,7 @@ for i, (cust, proj) in enumerate(customers):
         '优先级': '高' if is_urgent == '是' else '普通',
     })
 
-write_records('tbl06oxGEdMNTEB8', main_orders, '销售订单主表')
+write_records(TABLE_ID_MAIN, main_orders, '销售订单主表')
 time.sleep(0.5)
 
 # ====== 3. 库存快照表 (对 30 个 TEST_ SKU, 3 天库存) ======
@@ -192,7 +215,7 @@ for sku_idx, sku in enumerate(skus):
             '导入批次号': int(inv_date.timestamp() * 1000),
         })
 
-write_records('tblFZNdEwW50izjh', inv_records, '库存快照表')
+write_records(TABLE_ID_INV, inv_records, '库存快照表')
 time.sleep(0.5)
 
 # ====== 4. 销售订单明细表 (约 60 条订单行) ======
@@ -263,8 +286,8 @@ for j in range(2):
         '是否RB800': '否',
     })
 
-write_records('tbl06oxGEdMNTEB8', [main_orders[-1]], '销售订单主表(已确认合同)')
-write_records('tblJn5iP6imjzE8h', items, '销售订单明细表')
+write_records(TABLE_ID_MAIN, [main_orders[-1]], '销售订单主表(已确认合同)')
+write_records(TABLE_ID_ITEMS, items, '销售订单明细表')
 time.sleep(0.5)
 
 print(f'\n{"=" * 60}')
