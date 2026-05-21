@@ -1,0 +1,31 @@
+{
+  "autoApproval": {
+    "enabled": true,
+    "actions": ["read"],
+    "tools": ["Read", "Glob", "Grep"],
+    "dangerous": {
+      "allowBashOutsideProject": false,
+      "allowGit": true,
+      "allowHttpRequests": false
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(pytest:*)",
+      "Bash(python:main.py)",
+      "Bash(python:test_*.py)",
+      "Bash(git:status)",
+      "Bash(git:diff)"
+    ],
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(curl:*)",
+      "Bash(feishu*write:*)",
+      "Bash(bitable*update:*)",
+      "Bash(bitable*insert:*)",
+      "Write",
+      "Edit"
+    ]
+  },
+  "comment": "严格模式：只允许读取和执行测试脚本，禁止任何写入和编辑操作。如有需要，临时手动批准。"
+}

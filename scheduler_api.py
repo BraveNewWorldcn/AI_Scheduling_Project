@@ -1913,6 +1913,62 @@ def get_today_report_row() -> dict:
     return report
 
 
+def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: dict) -> None:
+    """排单完成后私聊通知排单负责人，失败不影响排单。"""
+    planner_open_id = os.getenv("PLANNER_OPEN_ID", "").strip()
+    if not planner_open_id:
+        return
+
+    try:
+        token_resp = httpx.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, timeout=15.0,
+        )
+        token = token_resp.json().get("tenant_access_token", "")
+        if not token:
+            return
+
+        total = len(summary) if summary is not None else 0
+        pending = int(summary[summary["订单状态"] == "待确认"].shape[0]) if summary is not None and not summary.empty else 0
+        shortage_orders = int(summary[summary["整体状态"] == "缺货"].shape[0]) if summary is not None and not summary.empty else 0
+
+        shortage_sku = report.get("最紧缺SKU", "") if report else ""
+        ship_3d = report.get("未来3天应发货订单数", "0") if report else "0"
+
+        lines = [
+            f"**排单批次**：{batch_id}",
+            f"**本次排单**：{total} 份合同",
+            f"**待人工确认**：**{pending}** 份",
+        ]
+        if shortage_orders > 0:
+            lines.append(f"**存在缺货**：{shortage_orders} 份合同需关注")
+        if shortage_sku:
+            lines.append(f"**紧缺物料**：{shortage_sku}")
+        lines.append(f"**未来3天应发货**：{ship_3d} 单")
+        lines.append("")
+        lines.append(f"[查看排单总表](https://wl6wihmop1.feishu.cn/base/C5JzbAfnia0nT3sRvjucXgUGnDc?table=tbl09Z6C7wCGh3mW&view=vewiuVK8pH)")
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"template": "blue", "title": {"content": "AI排单已完成，请确认", "tag": "plain_text"}},
+            "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+        }
+
+        httpx.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "receive_id": planner_open_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            },
+            timeout=15.0,
+        )
+        print("[个人通知] 排单完成私聊通知已发送")
+    except Exception as e:
+        print(f"[个人通知] 发送失败(不影响排单): {e}")
+
+
 def dispatch_schedule_notifications(report: dict) -> dict:
     """排单完成后触发飞书三线机器人通知，失败不阻断排单主流程。"""
     if not report:
@@ -2428,6 +2484,9 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                     print("飞书三线机器人通知已触发")
                 else:
                     print(f"飞书三线机器人通知失败(不影响排单): {notification_result.get('error')}")
+
+                # ----- 私聊通知排单完成 -----
+                _send_personal_notification(summary, batch_id, report)
         except Exception as e:
             print(f"AI排单日报生成失败(不影响排单): {e}")
     else:
@@ -2487,25 +2546,154 @@ def daily_report():
 
 
 # =========================
-# 飞书 Webhook 触发接口
+# 飞书 Webhook 触发接口（接收客户消息并自动回复）
 # =========================
+
+# 消息去重集合
+_seen_webhook_message_ids: set = set()
+
+
+def _get_bot_reply_token() -> str:
+    """获取订单客服机器人（CUSTOMER_BOT_APP_ID）的 token，用于回复客户消息。"""
+    bot_app_id = os.getenv("CUSTOMER_BOT_APP_ID", "")
+    bot_app_secret = os.getenv("CUSTOMER_BOT_APP_SECRET", "")
+    if not bot_app_id or not bot_app_secret:
+        raise Exception("缺少 CUSTOMER_BOT_APP_ID 或 CUSTOMER_BOT_APP_SECRET 环境变量")
+    resp = httpx.post(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": bot_app_id, "app_secret": bot_app_secret}, timeout=15.0,
+    )
+    data = _safe_http_json(resp, "获取Bot回复Token")
+    if data.get("code") != 0:
+        raise Exception(f"获取Bot回复Token失败: {data}")
+    return data["tenant_access_token"]
+
+
+def _send_bot_reply(open_id: str, card: dict):
+    """以订单客服机器人身份发送互动卡片回复。"""
+    token = _get_bot_reply_token()
+    resp = httpx.post(
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        timeout=15.0,
+    )
+    data = _safe_http_json(resp, "发送Bot回复")
+    if data.get("code") != 0:
+        print(f"[Bot回复] 发送失败: {data}")
+        return False
+    print("[Bot回复] 发送成功")
+    return True
+
+
 @app.post("/webhook/feishu")
 async def feishu_webhook(request: Request):
     body = await request.json()
 
+    # ---- 诊断：打印请求体顶层结构 ----
+    body_keys = list(body.keys())
+    print(f"[Webhook] 收到请求, 顶层字段: {body_keys}")
+
+    # URL 验证（飞书配置事件订阅时的 challenge 校验）
     if "challenge" in body:
         print("飞书URL验证成功")
         return {"challenge": body["challenge"]}
 
-    print("========== 收到飞书事件 ==========")
+    # 加密事件检测
+    if "encrypt" in body:
+        print("[Webhook] 检测到加密事件，需要在飞书开放平台关闭事件加密，或配置 Encrypt Key 解密")
+        return {"msg": "ok"}
 
+    # ---- 解析事件（兼容 V1 和 V2 两种格式） ----
+    header = body.get("header", {})
+    event = body.get("event", {})
+    event_type = ""
+
+    # V2 格式: {schema, header: {event_type, ...}, event: {sender: {sender_id: {open_id}}, message: {chat_type, message_type, content}}}
+    if header and isinstance(event, dict):
+        event_type = header.get("event_type", "")
+
+    # V1 格式: {type: "event_callback", event: {type: "im.message.receive_v1", open_id, msg_type, text, ...}}
+    if not event_type and isinstance(event, dict):
+        event_type = event.get("type", "")
+
+    print(f"[Webhook] event_type={event_type}")
+
+    if event_type != "im.message.receive_v1":
+        print(f"[Webhook] 忽略非消息事件: event_type={event_type}")
+        return {"msg": "ok"}
+
+    # ---- 提取消息字段（兼容 V1 / V2） ----
+    if header and "message" in event:
+        # V2 格式
+        message = event.get("message", {})
+        sender = event.get("sender", {})
+        sender_id_obj = sender.get("sender_id", {})
+        open_id = sender_id_obj.get("open_id", "")
+        sender_type = sender.get("sender_type", "")
+        chat_type = message.get("chat_type", "")
+        message_type = message.get("message_type", "")
+        content_str = message.get("content", "{}")
+        message_id = message.get("message_id", "")
+        # 解析 content JSON → text
+        try:
+            user_input = json.loads(content_str).get("text", "").strip()
+        except json.JSONDecodeError:
+            user_input = content_str.strip()
+    else:
+        # V1 格式: event 内平铺字段
+        open_id = event.get("open_id", "")
+        sender_type = event.get("sender_type", "user")
+        chat_type = event.get("chat_type", "")
+        message_type = event.get("msg_type", "text")
+        user_input = (event.get("text") or "").strip()
+        message_id = event.get("open_message_id", "")
+
+    print(f"[Webhook] open_id={open_id[:16] if open_id else '(空)'}..., "
+          f"chat_type={chat_type}, sender_type={sender_type}, message_type={message_type}")
+    print(f"[Webhook] text={user_input[:100] if user_input else '(空)'}")
+
+    # ---- 过滤 ----
+    if chat_type and chat_type != "p2p":
+        print(f"[Webhook] 跳过非私聊: chat_type={chat_type}")
+        return {"msg": "ok"}
+    if sender_type and sender_type != "user":
+        print(f"[Webhook] 跳过非用户: sender_type={sender_type}")
+        return {"msg": "ok"}
+    if message_type and message_type != "text":
+        print(f"[Webhook] 跳过非文本: message_type={message_type}")
+        return {"msg": "ok"}
+    if not open_id:
+        print("[Webhook] open_id 为空, 无法回复")
+        return {"msg": "ok"}
+    if not user_input:
+        print("[Webhook] 消息文本为空")
+        return {"msg": "ok"}
+
+    # ---- 去重 ----
+    if message_id:
+        if message_id in _seen_webhook_message_ids:
+            print(f"[Webhook] 重复消息已忽略: message_id={message_id}")
+            return {"msg": "ok"}
+        _seen_webhook_message_ids.add(message_id)
+        if len(_seen_webhook_message_ids) > 5000:
+            _seen_webhook_message_ids.clear()
+
+    # ---- 处理并回复 ----
     try:
-        print("开始重新加载飞书数据...")
-        load_data()
-        print("飞书数据加载成功，当前数据量：", len(data_cache["items"]))
+        from customer_agent import process_message as bot_process_message
+        card = bot_process_message(open_id, user_input)
+        _send_bot_reply(open_id, card)
     except Exception as e:
-        print("飞书数据加载失败：", str(e))
-        return {"error": f"飞书数据加载失败: {str(e)}"}
+        print(f"[Webhook] 处理异常: {e}")
+        import traceback
+        traceback.print_exc()
+
+    return {"msg": "ok"}
 
 
 if __name__ == "__main__":

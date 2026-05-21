@@ -14,12 +14,18 @@ import json
 import os
 import sys
 import re
+import time
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from difflib import SequenceMatcher
 
 import httpx
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 # ----- 自动加载 .env -----
 def _load_dotenv():
@@ -43,33 +49,69 @@ CST = timezone(timedelta(hours=8))
 
 APP_ID = os.getenv("CUSTOMER_BOT_APP_ID", "")
 APP_SECRET = os.getenv("CUSTOMER_BOT_APP_SECRET")
+DATA_APP_ID = os.getenv("FEISHU_APP_ID", APP_ID)
+DATA_APP_SECRET = os.getenv("FEISHU_APP_SECRET", APP_SECRET)
 APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "")
 TABLE_ID_MAIN = os.getenv("TABLE_ID_MAIN", "tbl06oxGEdMNTEB8")
 TABLE_ID_DETAIL = os.getenv("TABLE_ID_DETAIL", "tbl09Z6C7wCGh3mW")
 
-LARK_CLI = os.path.expandvars(r"%APPDATA%\npm\lark-cli.cmd")
-if not os.path.isfile(LARK_CLI):
-    LARK_CLI = "lark-cli"
-
 if not APP_SECRET:
-    sys.exit("[X] 请先设置 FEISHU_APP_SECRET")
+    sys.exit("[X] 请先设置 CUSTOMER_BOT_APP_SECRET")
 
 # ===== 会话缓存（消歧卡片选择） =====
 # {open_id: [{"合同编号":..., "项目名称":...}, ...]}
 _session_cache: Dict[str, List[Dict[str, str]]] = {}
+_seen_event_ids: set[str] = set()
+_token_cache: Dict[str, tuple[str, datetime]] = {}
+_lark_cli_path: str = ""
+
+
+def _find_lark_cli() -> str:
+    global _lark_cli_path
+    if _lark_cli_path:
+        return _lark_cli_path
+    candidates = [
+        os.path.expandvars(r"%APPDATA%\npm\lark-cli.cmd"),
+    ]
+    if sys.platform != "win32":
+        candidates += ["/usr/local/bin/lark-cli", "/opt/homebrew/bin/lark-cli"]
+    for p in candidates:
+        if os.path.isfile(p):
+            _lark_cli_path = p
+            return p
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        for name in ("lark-cli.cmd", "lark-cli"):
+            full = os.path.join(p, name)
+            if os.path.isfile(full):
+                _lark_cli_path = full
+                return full
+    return "lark-cli"
 
 
 # ===== 工具函数 =====
 
-def _get_bot_token() -> str:
+def _get_token(app_id: str, app_secret: str) -> str:
+    cached = _token_cache.get(app_id)
+    if cached and cached[1] > datetime.now(CST) + timedelta(minutes=5):
+        return cached[0]
     resp = httpx.post(
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        json={"app_id": APP_ID, "app_secret": APP_SECRET}, timeout=30.0,
+        json={"app_id": app_id, "app_secret": app_secret}, timeout=30.0,
     )
     data = resp.json()
     if data.get("code") != 0:
         raise Exception(f"获取 Token 失败: {data}")
-    return data["tenant_access_token"]
+    token = data["tenant_access_token"]
+    _token_cache[app_id] = (token, datetime.now(CST) + timedelta(seconds=6600))
+    return token
+
+
+def _get_bot_token() -> str:
+    return _get_token(APP_ID, APP_SECRET)
+
+
+def _get_data_token() -> str:
+    return _get_token(DATA_APP_ID, DATA_APP_SECRET)
 
 
 def _parse_feishu_value(value: Any) -> str:
@@ -87,6 +129,24 @@ def _parse_feishu_value(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     return str(value).strip()
+
+
+def _parse_feishu_date(value: Any) -> str:
+    if isinstance(value, (int, float)) and value > 0:
+        try:
+            ts = value / 1000 if value >= 10_000_000_000 else value
+            return datetime.fromtimestamp(ts, tz=CST).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    text = _parse_feishu_value(value)
+    if re.fullmatch(r"\d{10,13}", text):
+        try:
+            n = int(text)
+            ts = n / 1000 if n >= 10_000_000_000 else n
+            return datetime.fromtimestamp(ts, tz=CST).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return text[:10] if len(text) >= 10 else text
 
 
 def _fuzzy_score(query: str, target: str) -> float:
@@ -128,7 +188,7 @@ def _extract_company_name(open_id: str) -> Optional[str]:
 # ===== 第二层：模糊匹配 =====
 
 def _load_company_orders(company_name: str) -> List[Dict[str, str]]:
-    token = _get_bot_token()
+    token = _get_data_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     base = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN}"
     orders: List[Dict[str, str]] = []
@@ -141,11 +201,11 @@ def _load_company_orders(company_name: str) -> List[Dict[str, str]]:
                          headers=headers, params=params, timeout=30.0)
         data = resp.json()
         if data.get("code") != 0:
-            break
+            raise Exception(f"读取销售订单主表失败: {data}")
         for item in data.get("data", {}).get("items", []):
             f = item.get("fields", {})
             cust = _parse_feishu_value(f.get("客户名称"))
-            if _fuzzy_score(company_name, cust) < 0.3:
+            if company_name and _fuzzy_score(company_name, cust) < 0.3:
                 continue
             orders.append({
                 "合同编号": _parse_feishu_value(f.get("合同编号")),
@@ -169,6 +229,15 @@ def _extract_keywords(user_input: str) -> List[str]:
 
 
 def _fuzzy_match_orders(orders: List[Dict[str, str]], user_input: str) -> List[Dict[str, Any]]:
+    query = user_input.strip().lower()
+    exact_contracts = [
+        {**order, "_score": 1.0}
+        for order in orders
+        if order.get("合同编号", "").strip().lower() and order.get("合同编号", "").strip().lower() in query
+    ]
+    if exact_contracts:
+        return exact_contracts[:1]
+
     keywords = _extract_keywords(user_input)
     scored: List[tuple] = []
     for order in orders:
@@ -214,7 +283,7 @@ def _build_disambiguation_card(candidates: List[Dict[str, Any]], open_id: str) -
 # ===== 第四层：交付卡片 =====
 
 def _load_order_detail(contract_id: str) -> Optional[Dict[str, str]]:
-    token = _get_bot_token()
+    token = _get_data_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     base = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN}"
     page_token = None
@@ -226,15 +295,15 @@ def _load_order_detail(contract_id: str) -> Optional[Dict[str, str]]:
                          headers=headers, params=params, timeout=30.0)
         data = resp.json()
         if data.get("code") != 0:
-            break
+            raise Exception(f"读取AI排单总表失败: {data}")
         for item in data.get("data", {}).get("items", []):
             f = item.get("fields", {})
             if _parse_feishu_value(f.get("合同编号")) == contract_id:
                 return {
                     "合同编号": contract_id,
                     "项目名称": _parse_feishu_value(f.get("项目名称")),
-                    "AI建议发货时间": _parse_feishu_value(f.get("AI建议发货时间")),
-                    "人工确认发货时间": _parse_feishu_value(f.get("人工确认发货时间")),
+                    "AI建议发货时间": _parse_feishu_date(f.get("AI建议发货时间")),
+                    "人工确认发货时间": _parse_feishu_date(f.get("人工确认发货时间")),
                     "整体状态": _parse_feishu_value(f.get("整体状态")),
                     "订单状态": _parse_feishu_value(f.get("订单状态")),
                     "AI风险": _parse_feishu_value(f.get("AI风险")),
@@ -249,40 +318,65 @@ def _load_order_detail(contract_id: str) -> Optional[Dict[str, str]]:
 def _build_delivery_card(order: Dict[str, str]) -> dict:
     contract = order.get("合同编号", "-")
     project = order.get("项目名称", "-")
-    status = order.get("整体状态", "未知")
+    status = order.get("整体状态", "有货")
     order_status = order.get("订单状态", "待确认")
-    ai_ship = order.get("AI建议发货时间", "-")
+    ai_ship = order.get("AI建议发货时间", "")
     manual_ship = order.get("人工确认发货时间", "")
-    ai_risk = order.get("AI风险", "")
-    ai_advice = order.get("AI建议", "")
+
+    ship_date_raw = (manual_ship or ai_ship or "").strip()
+    ship_date_display = "待定"
+    if ship_date_raw:
+        try:
+            d = datetime.strptime(ship_date_raw[:10], "%Y-%m-%d")
+            ship_date_display = f"{d.month}月{d.day}日"
+        except Exception:
+            ship_date_display = ship_date_raw
+
+    # ---- 文案包装（绝不可出现：缺货/断供/风险/待补/紧急采购等）----
+    if order_status == "已发货":
+        header = "🚚 您的设备已发出"
+        color = "green"
+    elif order_status == "已确认":
+        header = "📋 您的交付批次已确认"
+        color = "blue"
+    else:
+        header = "📦 项目交付进度"
+        color = "blue"
 
     if status == "缺货":
-        color, status_text = "red", "🔴 缺货待补"
-    elif order_status == "已发货":
-        color, status_text = "green", "🟢 已发货"
-    elif order_status == "已确认":
-        color, status_text = "blue", "🔵 已确认待发货"
+        status_line = (
+            f"关于您关注的【**{project}**】项目（合同编号：{contract}），"
+            f"目前设备正在按计划为您有序排产备货中。"
+        )
+        detail_line = "核心模块正在进行严密的出厂前质量验证与软硬件联调测试，确保设备到场后稳定运行。"
+        if ship_date_raw:
+            delivery_line = (
+                f"您的专属交付批次已锁定，我们将确保在 **{ship_date_display}** 为您准时安排发出。"
+            )
+        else:
+            delivery_line = "您的专属交付批次确认后，我会第一时间为您同步预计发出时间。"
     else:
-        color, status_text = "orange", "🟠 AI 排单中"
+        status_line = (
+            f"关于您关注的【**{project}**】项目（合同编号：{contract}），一切进展顺利。"
+        )
+        detail_line = "设备正在完成出厂前的最终调试与防震包装，确保运输安全与到场即用。"
+        if ship_date_raw:
+            delivery_line = (
+                f"您的专属交付批次已排定，预计 **{ship_date_display}** 为您准时发出。"
+            )
+        else:
+            delivery_line = "您的专属交付批次确认后，我会第一时间为您同步预计发出时间。"
 
-    ship_date = manual_ship or ai_ship or "待定"
     markdown = (
-        f"**合同编号**：{contract}\n"
-        f"**项目名称**：{project}\n"
-        f"**当前状态**：{status_text}\n"
-        f"**预计发货**：{ship_date}\n"
+        f"{status_line}\n\n"
+        f"{detail_line}\n\n"
+        f"{delivery_line}\n\n"
+        f"📮 发货后我会第一时间为您同步物流单号及追踪信息，请您放心。"
     )
-    if ai_risk and ai_risk != "无明显风险":
-        markdown += f"**风险提示**：{ai_risk}\n"
-    if ai_advice:
-        markdown += f"**AI 建议**：{ai_advice}\n"
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": {
-            "template": color,
-            "title": {"content": "📦 订单履约状态", "tag": "plain_text"},
-        },
+        "header": {"template": color, "title": {"content": header, "tag": "plain_text"}},
         "elements": [{"tag": "markdown", "content": markdown}],
     }
 
@@ -343,16 +437,16 @@ def process_message(open_id: str, user_input: str) -> dict:
 
     # 第一层：身份提取
     company = _extract_company_name(open_id)
-    if not company:
-        return _build_simple_card(
-            "🔐 身份未识别",
-            "抱歉，未识别到您的企业身份。请联系您的专属销售进行信息绑定。",
-            "red",
-        )
 
-    # 加载公司订单子集
-    orders = _load_company_orders(company)
+    # 加载订单子集。外部联系人可能取不到 company_name，允许用合同号/项目关键词兜底查询。
+    orders = _load_company_orders(company or "")
     if not orders:
+        if not company:
+            return _build_simple_card(
+                "🔐 身份未识别",
+                "抱歉，未识别到您的企业身份。请直接发送合同编号或项目关键词，我会继续帮您查找。",
+                "orange",
+            )
         return _build_simple_card(
             "📭 暂无在途订单",
             f"已识别「{company}」，但当前系统中暂无在途订单。如需帮助请联系销售。",
@@ -362,9 +456,10 @@ def process_message(open_id: str, user_input: str) -> dict:
     # 第二层：模糊匹配
     candidates = _fuzzy_match_orders(orders, user_input)
     if not candidates:
+        scope_text = f"「{company}」的订单" if company else "当前订单库"
         return _build_simple_card(
             "🔍 未找到匹配项目",
-            f"在「{company}」的订单中未找到与「{user_input}」匹配的项目。请尝试输入项目关键词。",
+            f"在{scope_text}中未找到与「{user_input}」匹配的项目。请尝试输入合同编号或更完整的项目关键词。",
             "orange",
         )
 
@@ -389,7 +484,7 @@ def process_message(open_id: str, user_input: str) -> dict:
 def _send_reply(open_id: str, card: dict):
     token = _get_bot_token()
     url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
-    httpx.post(
+    resp = httpx.post(
         url,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={
@@ -399,86 +494,165 @@ def _send_reply(open_id: str, card: dict):
         },
         timeout=15.0,
     )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise Exception(f"发送回复失败: {data}")
 
 
-# ===== 长连接事件主循环 =====
+def _extract_message_from_event(event: dict) -> tuple[str, str, str]:
+    """兼容 lark-cli 扁平事件与飞书 V2 envelope，返回 open_id/message_type/text。"""
+    event_id = str(event.get("event_id") or event.get("header", {}).get("event_id") or "")
+    if event_id:
+        if event_id in _seen_event_ids:
+            return "", "", ""
+        _seen_event_ids.add(event_id)
+
+    # lark-cli event schema im.message.receive_v1 当前输出为扁平结构：
+    # {sender_id, message_type, content, ...}，其中 content 对 text 已预渲染为纯文本。
+    if "sender_id" in event or "message_type" in event:
+        open_id = str(event.get("sender_id") or "")
+        msg_type = str(event.get("message_type") or "text")
+        content = event.get("content") or ""
+        return open_id, msg_type, str(content)
+
+    payload = event.get("event", {})
+    message = payload.get("message", {})
+    sender = payload.get("sender", {}).get("sender_id", {})
+    open_id = sender.get("open_id", "")
+    msg_type = message.get("msg_type", "text")
+    content_str = message.get("content", "{}")
+
+    try:
+        content = json.loads(content_str)
+    except json.JSONDecodeError:
+        content = {}
+
+    user_input = ""
+    if msg_type == "text":
+        user_input = content.get("text", "")
+    elif msg_type == "post":
+        for block in content.get("content", []):
+            for elem in block:
+                if elem.get("tag") == "text":
+                    user_input += elem.get("text", "")
+    return open_id, msg_type, user_input
+
+
+# ===== lark-cli 长连接事件主循环 =====
 
 def main():
     print("=" * 55)
-    print("  客户查单中枢 (长连接模式)")
+    print("  客户查单中枢 (长连接事件模式)")
     print(f"  启动时间：{datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  应用 ID：{APP_ID}")
-    print("  监听事件：im.message.receive_v1")
     print("=" * 55)
 
-    cmd = [LARK_CLI, "event", "consume", "im.message.receive_v1", "--as", "bot"]
+    lark_cli = _find_lark_cli()
+    print(f"  lark-cli: {lark_cli}")
+    print("[OK] 启动长连接，等待客户消息...\n")
 
-    env = os.environ.copy()
-    env["LARK_APP_ID"] = APP_ID
-    env["LARK_APP_SECRET"] = APP_SECRET
+    # 定期清理去重集合
+    _last_dedup_clean = datetime.now(CST)
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        encoding="utf-8",
-        bufsize=1,
-        env=env,
-    )
+    while True:
+        try:
+            proc = subprocess.Popen(
+                [lark_cli, "event", "consume", "im.message.receive_v1", "--as", "bot"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
 
-    print("[OK] 长连接已建立，等待客户消息...\n")
+            # 用守护线程读取 stderr，等待就绪标记
+            ready_event = threading.Event()
 
-    try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
+            def _read_stderr():
+                try:
+                    for line in iter(proc.stderr.readline, ""):
+                        stripped = line.rstrip("\n").rstrip("\r")
+                        if stripped:
+                            print(f"  [lark-cli] {stripped}")
+                        if "[event] ready" in stripped:
+                            ready_event.set()
+                except Exception:
+                    pass
+
+            t = threading.Thread(target=_read_stderr, daemon=True)
+            t.start()
+
+            # 等待就绪标记，超时 30 秒
+            if not ready_event.wait(timeout=30):
+                print("[X] lark-cli 启动超时，5秒后重试...")
+                proc.kill()
+                proc.wait()
+                time.sleep(5)
                 continue
 
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
+            if proc.poll() is not None:
+                print(f"[X] lark-cli 异常退出 (code={proc.returncode})，5秒后重试...")
+                time.sleep(5)
                 continue
 
-            # 提取消息内容
-            message = event.get("event", {}).get("message", {})
-            sender = event.get("event", {}).get("sender", {}).get("sender_id", {})
-            open_id = sender.get("open_id", "")
-            msg_type = message.get("msg_type", "text")
-            content_str = message.get("content", "{}")
+            print("[OK] 长连接就绪，开始接收事件\n")
 
-            try:
-                content = json.loads(content_str)
-            except json.JSONDecodeError:
-                content = {}
+            # 读取 NDJSON 事件流
+            for line in iter(proc.stdout.readline, ""):
+                stripped = line.strip()
+                if not stripped:
+                    continue
 
-            user_input = ""
-            if msg_type == "text":
-                user_input = content.get("text", "")
-            elif msg_type == "post":
-                for block in content.get("content", []):
-                    for elem in block:
-                        if elem.get("tag") == "text":
-                            user_input += elem.get("text", "")
+                try:
+                    event = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
 
-            if not user_input.strip() or not open_id:
-                continue
+                # 只处理 P2P（私聊）消息，忽略群聊
+                chat_type = event.get("chat_type", "")
+                if chat_type != "p2p":
+                    continue
 
-            now = datetime.now(CST).strftime("%H:%M:%S")
-            print(f"[{now}] {open_id[:12]}...: {user_input[:60]}")
+                open_id, msg_type, user_input = _extract_message_from_event(event)
+                if not open_id or not user_input.strip():
+                    continue
 
-            try:
-                card = process_message(open_id, user_input)
-                _send_reply(open_id, card)
-                print(f"  -> 已回复")
-            except Exception as e:
-                print(f"  [X] 处理异常: {e}")
+                # 只处理文本消息
+                if msg_type != "text":
+                    continue
 
-    except KeyboardInterrupt:
-        print("\n[OK] 正常退出")
-    finally:
-        proc.terminate()
-        proc.wait()
+                now_str = datetime.now(CST).strftime("%H:%M:%S")
+                print(f"[{now_str}] {open_id[:12]}...: {user_input[:60]}")
+
+                try:
+                    card = process_message(open_id, user_input)
+                    _send_reply(open_id, card)
+                    print(f"  -> 已回复")
+                except Exception as e:
+                    print(f"  [X] 处理异常: {e}")
+
+                # 每 10 分钟清理去重集合
+                now = datetime.now(CST)
+                if (now - _last_dedup_clean).total_seconds() > 600:
+                    global _seen_event_ids
+                    if len(_seen_event_ids) > 5000:
+                        _seen_event_ids = set(list(_seen_event_ids)[-2500:])
+                    _last_dedup_clean = now
+
+            # stdout 关闭，进程退出
+            ret = proc.wait()
+            print(f"\n[X] lark-cli 进程退出 (code={ret})，5秒后重连...")
+            time.sleep(5)
+
+        except KeyboardInterrupt:
+            print("\n[OK] 正常退出")
+            break
+        except Exception as e:
+            print(f"\n[X] 异常 ({datetime.now(CST).strftime('%H:%M:%S')}): {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(5)
 
 
 if __name__ == "__main__":
