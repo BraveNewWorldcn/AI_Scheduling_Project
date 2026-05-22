@@ -538,26 +538,63 @@ def _extract_message_from_event(event: dict) -> tuple[str, str, str]:
     return open_id, msg_type, user_input
 
 
-# ===== lark-cli 长连接事件主循环 =====
+# ===== 双 App 长连接事件主循环 =====
 
-def main():
-    print("=" * 55)
-    print("  客户查单中枢 (长连接事件模式)")
-    print(f"  启动时间：{datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  应用 ID：{APP_ID}")
-    print("=" * 55)
+# 主 App（供应链AI助手）的回复配置
+MAIN_APP_ID = os.getenv("FEISHU_APP_ID", "")
+MAIN_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+MAIN_APP_TOKEN_CACHE: Dict[str, tuple] = {}
 
-    lark_cli = _find_lark_cli()
-    print(f"  lark-cli: {lark_cli}")
-    print("[OK] 启动长连接，等待客户消息...\n")
 
-    # 定期清理去重集合
-    _last_dedup_clean = datetime.now(CST)
+def _get_main_app_token() -> str:
+    """获取主 App（供应链AI助手）的 token。"""
+    if not MAIN_APP_SECRET:
+        raise Exception("缺少 FEISHU_APP_SECRET")
+    cached = MAIN_APP_TOKEN_CACHE.get("token")
+    if cached and cached[1] > datetime.now(CST) + timedelta(minutes=5):
+        return cached[0]
+    resp = httpx.post(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": MAIN_APP_ID, "app_secret": MAIN_APP_SECRET}, timeout=30.0,
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        raise Exception(f"获取主App Token 失败: {data}")
+    token = data["tenant_access_token"]
+    MAIN_APP_TOKEN_CACHE["token"] = (token, datetime.now(CST) + timedelta(seconds=6600))
+    return token
+
+
+def _send_main_app_reply(open_id: str, card: dict):
+    """以供应链AI助手身份发送回复。"""
+    token = _get_main_app_token()
+    resp = httpx.post(
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={
+            "receive_id": open_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        },
+        timeout=15.0,
+    )
+    data = resp.json()
+    if data.get("code") != 0:
+        print(f"  [供应链助手回复] 失败: {data}")
+        return False
+    return True
+
+
+def _run_event_loop(lark_cli_path: str, profile_args: List[str], label: str,
+                    handler_func, reply_func):
+    """单个 App 的事件消费循环（在独立线程中运行）。"""
+    print(f"[{label}] 启动长连接...")
 
     while True:
         try:
+            cmd = [lark_cli_path] + profile_args + ["event", "consume", "im.message.receive_v1", "--as", "bot"]
             proc = subprocess.Popen(
-                [lark_cli, "event", "consume", "im.message.receive_v1", "--as", "bot"],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE,
@@ -566,7 +603,6 @@ def main():
                 bufsize=1,
             )
 
-            # 用守护线程读取 stderr，等待就绪标记
             ready_event = threading.Event()
 
             def _read_stderr():
@@ -574,7 +610,7 @@ def main():
                     for line in iter(proc.stderr.readline, ""):
                         stripped = line.rstrip("\n").rstrip("\r")
                         if stripped:
-                            print(f"  [lark-cli] {stripped}")
+                            print(f"  [{label}] {stripped}")
                         if "[event] ready" in stripped:
                             ready_event.set()
                 except Exception:
@@ -583,33 +619,29 @@ def main():
             t = threading.Thread(target=_read_stderr, daemon=True)
             t.start()
 
-            # 等待就绪标记，超时 30 秒
             if not ready_event.wait(timeout=30):
-                print("[X] lark-cli 启动超时，5秒后重试...")
+                print(f"[{label}] 启动超时，5秒后重试...")
                 proc.kill()
                 proc.wait()
                 time.sleep(5)
                 continue
 
             if proc.poll() is not None:
-                print(f"[X] lark-cli 异常退出 (code={proc.returncode})，5秒后重试...")
+                print(f"[{label}] 异常退出 (code={proc.returncode})，5秒后重试...")
                 time.sleep(5)
                 continue
 
-            print("[OK] 长连接就绪，开始接收事件\n")
+            print(f"[{label}] 就绪，接收事件中")
 
-            # 读取 NDJSON 事件流
             for line in iter(proc.stdout.readline, ""):
                 stripped = line.strip()
                 if not stripped:
                     continue
-
                 try:
                     event = json.loads(stripped)
                 except json.JSONDecodeError:
                     continue
 
-                # 只处理 P2P（私聊）消息，忽略群聊
                 chat_type = event.get("chat_type", "")
                 if chat_type != "p2p":
                     continue
@@ -617,42 +649,81 @@ def main():
                 open_id, msg_type, user_input = _extract_message_from_event(event)
                 if not open_id or not user_input.strip():
                     continue
-
-                # 只处理文本消息
                 if msg_type != "text":
                     continue
 
                 now_str = datetime.now(CST).strftime("%H:%M:%S")
-                print(f"[{now_str}] {open_id[:12]}...: {user_input[:60]}")
+                print(f"[{label}] {now_str} {open_id[:12]}...: {user_input[:60]}")
 
                 try:
-                    card = process_message(open_id, user_input)
-                    _send_reply(open_id, card)
-                    print(f"  -> 已回复")
+                    card = handler_func(open_id, user_input)
+                    reply_func(open_id, card)
+                    print(f"[{label}]  -> 已回复")
                 except Exception as e:
-                    print(f"  [X] 处理异常: {e}")
+                    print(f"[{label}]  [X] 处理异常: {e}")
 
-                # 每 10 分钟清理去重集合
-                now = datetime.now(CST)
-                if (now - _last_dedup_clean).total_seconds() > 600:
-                    global _seen_event_ids
-                    if len(_seen_event_ids) > 5000:
-                        _seen_event_ids = set(list(_seen_event_ids)[-2500:])
-                    _last_dedup_clean = now
-
-            # stdout 关闭，进程退出
             ret = proc.wait()
-            print(f"\n[X] lark-cli 进程退出 (code={ret})，5秒后重连...")
+            print(f"[{label}] 进程退出 (code={ret})，5秒后重连...")
             time.sleep(5)
 
-        except KeyboardInterrupt:
-            print("\n[OK] 正常退出")
-            break
         except Exception as e:
-            print(f"\n[X] 异常 ({datetime.now(CST).strftime('%H:%M:%S')}): {e}")
+            print(f"[{label}] 异常: {e}")
             import traceback
             traceback.print_exc()
             time.sleep(5)
+
+
+def _supply_chain_handler(open_id: str, user_input: str) -> dict:
+    """供应链AI助手消息处理（延迟导入 scheduler_api 模块以复用逻辑）。"""
+    try:
+        from scheduler_api import _build_supply_chain_reply
+        return _build_supply_chain_reply(open_id, user_input)
+    except ImportError:
+        # 回退：简单的引导卡片
+        return {
+            "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
+            "elements": [{"tag": "markdown", "content": (
+                "我是供应链AI助手。\n\n📊 发送 **日报** / **库存** / **待确认** / **延迟** 查询相关信息\n🔍 发送**合同编号**查询订单详情"
+            )}],
+        }
+
+
+def main():
+    print("=" * 55)
+    print("  双机器人长连接中枢")
+    print(f"  启动时间：{datetime.now(CST).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  订单查询助手 App：{APP_ID}")
+    print(f"  供应链AI助手 App：{MAIN_APP_ID}")
+    print("=" * 55)
+
+    lark_cli = _find_lark_cli()
+    print(f"  lark-cli: {lark_cli}")
+    print("[OK] 启动双路长连接，等待消息...\n")
+
+    # 订单查询助手（默认 profile = 客服机器人）
+    t1 = threading.Thread(
+        target=_run_event_loop,
+        args=(lark_cli, [], "订单查询助手", process_message, _send_reply),
+        daemon=True,
+    )
+    t1.start()
+
+    # 供应链AI助手（--profile main-app）
+    t2 = threading.Thread(
+        target=_run_event_loop,
+        args=(lark_cli, ["--profile", "main-app"], "供应链AI助手",
+              _supply_chain_handler, _send_main_app_reply),
+        daemon=True,
+    )
+    t2.start()
+
+    print("[OK] 两个机器人都已启动\n")
+
+    try:
+        while t1.is_alive() or t2.is_alive():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[OK] 正常退出")
 
 
 if __name__ == "__main__":

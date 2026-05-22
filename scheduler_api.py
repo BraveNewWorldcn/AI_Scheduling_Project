@@ -2549,29 +2549,57 @@ def daily_report():
 # 飞书 Webhook 触发接口（接收客户消息并自动回复）
 # =========================
 
-# 消息去重集合
-_seen_webhook_message_ids: set = set()
+# ===== 多 App Bot 回复配置 =====
+# 每个飞书应用的凭证映射，用于以正确的机器人身份回复消息
+_BOT_CREDENTIALS = {
+    "cli_aa87f7619df8dbb3": {  # 订单查询助手
+        "app_id": os.getenv("CUSTOMER_BOT_APP_ID", ""),
+        "app_secret": os.getenv("CUSTOMER_BOT_APP_SECRET", ""),
+        "name": "订单查询助手",
+    },
+    "cli_a96c5d017d3a1cbb": {  # 供应链AI助手
+        "app_id": os.getenv("FEISHU_APP_ID", ""),
+        "app_secret": os.getenv("FEISHU_APP_SECRET", ""),
+        "name": "供应链AI助手",
+    },
+}
+
+# token 缓存（按 app_id）
+_bot_token_cache: Dict[str, tuple] = {}
 
 
-def _get_bot_reply_token() -> str:
-    """获取订单客服机器人（CUSTOMER_BOT_APP_ID）的 token，用于回复客户消息。"""
-    bot_app_id = os.getenv("CUSTOMER_BOT_APP_ID", "")
-    bot_app_secret = os.getenv("CUSTOMER_BOT_APP_SECRET", "")
+def _get_bot_reply_token(app_id: str = "") -> str:
+    """根据飞书 app_id 获取对应的 tenant_access_token，用于回复消息。"""
+    creds = _BOT_CREDENTIALS.get(app_id)
+    if not creds:
+        # 回退：使用 CUSTOMER_BOT 凭证
+        creds = _BOT_CREDENTIALS.get("cli_aa87f7619df8dbb3", {})
+    bot_app_id = creds.get("app_id", "")
+    bot_app_secret = creds.get("app_secret", "")
     if not bot_app_id or not bot_app_secret:
-        raise Exception("缺少 CUSTOMER_BOT_APP_ID 或 CUSTOMER_BOT_APP_SECRET 环境变量")
+        raise Exception(f"缺少 App {app_id} 的凭证配置")
+
+    # 检查缓存
+    cached = _bot_token_cache.get(bot_app_id)
+    if cached and cached[1] > time.time() + 300:
+        return cached[0]
+
     resp = httpx.post(
         "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
         json={"app_id": bot_app_id, "app_secret": bot_app_secret}, timeout=15.0,
     )
-    data = _safe_http_json(resp, "获取Bot回复Token")
+    data = _safe_http_json(resp, f"获取Bot回复Token({creds.get('name', app_id)})")
     if data.get("code") != 0:
         raise Exception(f"获取Bot回复Token失败: {data}")
-    return data["tenant_access_token"]
+    token = data["tenant_access_token"]
+    _bot_token_cache[bot_app_id] = (token, time.time() + 6600)
+    return token
 
 
-def _send_bot_reply(open_id: str, card: dict):
-    """以订单客服机器人身份发送互动卡片回复。"""
-    token = _get_bot_reply_token()
+def _send_bot_reply(open_id: str, card: dict, app_id: str = ""):
+    """以指定飞书应用的身份发送互动卡片回复。"""
+    token = _get_bot_reply_token(app_id)
+    name = _BOT_CREDENTIALS.get(app_id, {}).get("name", app_id)
     resp = httpx.post(
         "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -2582,12 +2610,394 @@ def _send_bot_reply(open_id: str, card: dict):
         },
         timeout=15.0,
     )
-    data = _safe_http_json(resp, "发送Bot回复")
+    data = _safe_http_json(resp, f"发送Bot回复({name})")
     if data.get("code") != 0:
-        print(f"[Bot回复] 发送失败: {data}")
+        print(f"[Bot回复:{name}] 发送失败: {data}")
         return False
-    print("[Bot回复] 发送成功")
+    print(f"[Bot回复:{name}] 发送成功")
     return True
+def _decrypt_event(encrypt_body: str) -> dict:
+    """解密飞书加密事件。
+
+    飞书开放平台 → 事件订阅 → 加密策略 中可获取 Encrypt Key。
+    将 ENCRYPT_KEY 配置到 .env 中。
+
+    加密格式：AES-256-CBC，数据 = 16字节IV + 密文
+    """
+    import hashlib
+    import base64
+
+    encrypt_key = os.getenv("FEISHU_EVENT_ENCRYPT_KEY", "")
+    if not encrypt_key:
+        raise Exception("收到加密事件，但未配置 FEISHU_EVENT_ENCRYPT_KEY。请在飞书开放平台获取 Encrypt Key 并添加到 .env")
+
+    key_bytes = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
+
+    try:
+        raw = base64.b64decode(encrypt_body)
+    except Exception:
+        raise Exception("事件加密数据 Base64 解码失败")
+
+    if len(raw) < 32:
+        raise Exception(f"加密数据太短 ({len(raw)} bytes)")
+
+    iv = raw[:16]
+    ciphertext = raw[16:]
+
+    # AES-256-CBC 解密
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        cipher = Cipher(algorithms.AES(key_bytes), modes.CBC(iv))
+        decryptor = cipher.decryptor()
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    except ImportError:
+        # 回退到纯 Python AES（如果没有 cryptography 库）
+        raise Exception(
+            "需要安装 cryptography 库来解密事件：pip install cryptography\n"
+            "或直接在飞书开放平台关闭事件加密（推荐）"
+        )
+
+    # 去除 PKCS7 padding
+    pad_len = plaintext[-1]
+    if isinstance(pad_len, int) and 1 <= pad_len <= 16:
+        plaintext = plaintext[:-pad_len]
+
+    try:
+        result = json.loads(plaintext.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise Exception(f"解密后 JSON 解析失败: {e}")
+
+    return result
+
+
+# 消息去重集合
+_seen_webhook_message_ids: set = set()
+
+
+# ==============================
+# 供应链AI助手 — 消息处理
+# ==============================
+def _build_supply_chain_reply(open_id: str, user_input: str) -> dict:
+    """处理供应链AI助手的消息，返回飞书互动卡片。
+
+    面向企业内部员工，提供排单、库存、交期等供应链管理功能。
+    """
+    import re
+    text = user_input.strip()
+
+    # ---- 闲聊检测 ----
+    chitchat_patterns = [
+        r"^(hi|hello|你好|在吗|嗨|哈喽)[\s!！。.]*$",
+        r"^(测试|test)$",
+    ]
+    for pat in chitchat_patterns:
+        if re.match(pat, text, re.IGNORECASE):
+            return {
+                "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
+                "elements": [{"tag": "markdown", "content": (
+                    "我是供应链AI助手，帮你掌握订单排单和交付全貌。\n\n"
+                    "📊 **常用指令**\n"
+                    "• 发送 **日报** — 查看今日排单日报\n"
+                    "• 发送 **库存** — 查看库存与缺货情况\n"
+                    "• 发送 **待确认** — 查看待人工确认的订单\n"
+                    "• 发送 **合同编号** — 查询具体订单交期\n"
+                    "• 发送 **延迟** — 查看延迟订单\n\n"
+                    "直接输入关键词即可查询 👇"
+                )}],
+            }
+
+    text_lower = text.lower()
+
+    # ---- 日报 ----
+    if any(kw in text_lower for kw in ["日报", "今日排单", "排单日报", "今日", "报告"]):
+        try:
+            report = get_today_report_row()
+            return _build_report_card(report)
+        except Exception as e:
+            return _error_card(f"读取日报失败: {e}")
+
+    # ---- 库存 ----
+    if any(kw in text_lower for kw in ["库存", "缺货", "物料", "紧缺"]):
+        try:
+            load_data_if_needed()
+            return _build_inventory_card()
+        except Exception as e:
+            return _error_card(f"读取库存失败: {e}")
+
+    # ---- 待确认 ----
+    if any(kw in text_lower for kw in ["待确认", "待处理", "未确认"]):
+        try:
+            load_data_if_needed()
+            return _build_pending_orders_card()
+        except Exception as e:
+            return _error_card(f"查询待确认订单失败: {e}")
+
+    # ---- 延迟 ----
+    if any(kw in text for kw in ["延迟", "延期", "推迟"]):
+        try:
+            load_data_if_needed()
+            return _build_delayed_orders_card()
+        except Exception as e:
+            return _error_card(f"查询延迟订单失败: {e}")
+
+    # ---- 帮助 ----
+    if any(kw in text_lower for kw in ["帮助", "help", "功能", "菜单", "说明"]):
+        return {
+            "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
+            "elements": [{"tag": "markdown", "content": (
+                "**📊 供应链AI助手功能菜单**\n\n"
+                "🔹 **日报** — 今日排单日报（订单数/发货/缺货/交期）\n"
+                "🔹 **库存** — 库存状态（充足/预警/缺货SKU/紧缺物料）\n"
+                "🔹 **待确认** — 需要人工确认的排单列表\n"
+                "🔹 **延迟** — 预计延迟的订单明细\n"
+                "🔹 **合同编号** — 输入合同编号查具体订单交期\n"
+                "🔹 **触发排单** — 手动触发一次AI排单（需权限）\n\n"
+                "👇 直接输入关键词即可"
+            )}],
+        }
+
+    # ---- 合同编号查询 ----
+    contract_match = re.search(r"([A-Za-z0-9\-_]{6,})", text)
+    if contract_match:
+        contract_id = contract_match.group(1)
+        try:
+            load_data_if_needed()
+            return _build_contract_card(contract_id)
+        except Exception as e:
+            return _error_card(f"查询合同失败: {e}")
+
+    # ---- 默认：模糊匹配 ----
+    return _build_default_card()
+
+
+def load_data_if_needed():
+    """按需加载数据（如果缓存为空则从飞书读取）。"""
+    if data_cache.get("items") is None or data_cache.get("inv") is None:
+        load_data()
+
+
+def _build_report_card(report: dict) -> dict:
+    """日报卡片。"""
+    items = [
+        f"📊 **今日排单日报** ({report.get('日期', '-')})",
+        "",
+        f"订单总数：**{report.get('订单总数', '-')}** 单　|　今日新增：**{report.get('今日新增订单', '-')}** 单",
+        f"已排单：**{report.get('已排单订单数', '-')}** 单　|　人工已确认：**{report.get('人工已确认排单数', '-')}** 单",
+        f"未排单：**{report.get('未排单订单数', '-')}** 单",
+        "",
+        f"🚚 今日应发：**{report.get('今日应发货订单数', '-')}** 单　|　可发：**{report.get('今日可发货订单数', '-')}** 单",
+        f"⚠️ 预计延迟：**{report.get('今日预计延迟订单数', '-')}** 单",
+        "",
+        f"📦 库存充足SKU：**{report.get('库存充足SKU数', '-')}**　|　预警：**{report.get('库存预警SKU数', '-')}**　|　缺货：**{report.get('库存缺货SKU数', '-')}**",
+    ]
+
+    shortage = report.get('最紧缺SKU', '')
+    if shortage and shortage != '无':
+        items.append(f"🔴 最紧缺：**{shortage}**（缺口 {report.get('最紧缺SKU缺口', '-')}）")
+
+    items.append("")
+    items.append(f"最长交期：**{report.get('最长交期订单', '-')}**　|　最晚发货：**{report.get('最晚发货日期', '-')}**")
+    items.append(f"未来3天应发：**{report.get('未来3天应发货订单数', '-')}** 单　|　缺货风险：**{report.get('未来3天缺货订单数', '-')}** 单")
+    items.append(f"批次号：{report.get('排单批次号', '-')}")
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue", "title": {"content": "📊 AI排单日报", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": "\n".join(items)}],
+    }
+
+
+def _build_inventory_card() -> dict:
+    """库存状态卡片。"""
+    inv = data_cache.get("inv")
+    sku_df = data_cache.get("sku")
+    items_df = data_cache.get("items")
+
+    if inv is None:
+        return _error_card("库存数据未加载，请先触发排单或等待数据刷新")
+
+    total_sku = inv["SKU"].nunique() if "SKU" in inv.columns else 0
+    total_qty = int(inv["库存数量"].sum()) if "库存数量" in inv.columns else 0
+
+    # 缺货 SKU（从明细表统计）
+    shortage_list: List[tuple] = []
+    if items_df is not None and not items_df.empty and "库存状态" in items_df.columns and "SKU编码" in items_df.columns:
+        shortage_items = items_df[items_df["库存状态"].astype(str).str.strip() == "缺货"]
+        if not shortage_items.empty:
+            gap_by_sku: Dict[str, float] = {}
+            for _, r in shortage_items.iterrows():
+                sku = safe_str(r.get("SKU编码", ""))
+                gap = to_num(r.get("缺口数量", 0))
+                if sku and gap > 0:
+                    gap_by_sku[sku] = gap_by_sku.get(sku, 0) + gap
+            shortage_list = sorted(gap_by_sku.items(), key=lambda x: x[1], reverse=True)[:8]
+
+    lines = [
+        f"📦 **库存总览**",
+        "",
+        f"SKU总数：**{total_sku}**　|　总库存量：**{total_qty:,}**",
+    ]
+
+    if shortage_list:
+        lines.append("")
+        lines.append("🔴 **缺货物料 TOP{0}**".format(min(len(shortage_list), 8)))
+        for sku_code, gap in shortage_list:
+            # 尝试从 SKU 表获取设备名称
+            name = ""
+            if sku_df is not None and not sku_df.empty and "产品编码SKU" in sku_df.columns:
+                match = sku_df[sku_df["产品编码SKU"].astype(str).str.strip() == sku_code]
+                if not match.empty:
+                    name = safe_str(match.iloc[0].get("设备名称", ""))
+            display = name if name else sku_code
+            gap_str = str(int(gap)) if gap == int(gap) else str(round(gap, 1))
+            lines.append(f"• **{display}** — 缺 **{gap_str}** 个")
+    else:
+        lines.append("")
+        lines.append("✅ 当前无缺货物料")
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "red" if shortage_list else "green",
+                    "title": {"content": "📦 库存状态", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+    }
+
+
+def _build_pending_orders_card() -> dict:
+    """待确认订单列表。"""
+    try:
+        summary = prepare_summary_status(fetch_bitable_to_df(TABLE_ID_DETAIL))
+    except Exception:
+        try:
+            summary = data_cache.get("summary")
+        except Exception:
+            summary = pd.DataFrame()
+
+    if summary is None or summary.empty:
+        return {"header": {"template": "blue", "title": {"content": "📋 待确认订单", "tag": "plain_text"}},
+                "elements": [{"tag": "markdown", "content": "暂无待确认订单数据"}]}
+
+    pending = summary[summary["订单状态"] == "待确认"].copy() if "订单状态" in summary.columns else pd.DataFrame()
+    if pending.empty:
+        return {"header": {"template": "green", "title": {"content": "✅ 待确认订单", "tag": "plain_text"}},
+                "elements": [{"tag": "markdown", "content": "当前没有待确认的订单，所有订单已处理。"}]}
+
+    pending = pending.head(15)
+    lines = [f"📋 **待确认订单 — {len(pending)} 份**", ""]
+    for _, r in pending.iterrows():
+        cid = safe_str(r.get("合同编号", "-"))
+        status = safe_str(r.get("整体状态", ""))
+        ship = safe_str(r.get("AI建议发货时间", ""))
+        if len(ship) >= 10:
+            ship = ship[:10]
+        flag = "🔴" if "缺货" in status else "🟢"
+        lines.append(f"{flag} {cid} — {ship}")
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "orange", "title": {"content": "📋 待确认订单", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+    }
+
+
+def _build_delayed_orders_card() -> dict:
+    """延迟订单列表。"""
+    try:
+        summary = prepare_summary_status(fetch_bitable_to_df(TABLE_ID_DETAIL))
+    except Exception:
+        return _error_card("无法读取排单总表")
+
+    if summary is None or summary.empty or "整体状态" not in summary.columns:
+        return {"header": {"template": "blue", "title": {"content": "⏳ 延迟订单", "tag": "plain_text"}},
+                "elements": [{"tag": "markdown", "content": "暂无延迟订单数据"}]}
+
+    delayed = summary[summary["整体状态"].astype(str).str.strip() == "缺货"].head(15)
+    if delayed.empty:
+        return {"header": {"template": "green", "title": {"content": "✅ 交付状态", "tag": "plain_text"}},
+                "elements": [{"tag": "markdown", "content": "当前所有订单交付正常，无延迟订单。"}]}
+
+    lines = [f"⚠️ **缺货/延迟订单 — {len(delayed)} 份**", ""]
+    for _, r in delayed.iterrows():
+        cid = safe_str(r.get("合同编号", "-"))
+        ship = safe_str(r.get("AI建议发货时间", ""))[:10]
+        manual = safe_str(r.get("人工确认发货时间", ""))[:10]
+        display_ship = manual if manual else ship
+        lines.append(f"🔴 {cid} — 预计 {display_ship}")
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "red", "title": {"content": "⚠️ 延迟订单", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+    }
+
+
+def _build_contract_card(contract_id: str) -> dict:
+    """单个合同详情卡片。"""
+    try:
+        detail_df = fetch_bitable_to_df(TABLE_ID_DETAIL)
+    except Exception:
+        return _error_card("无法读取排单总表")
+
+    if detail_df is None or detail_df.empty:
+        return _error_card(f"未找到合同 {contract_id} 的信息")
+
+    match = detail_df[detail_df["合同编号"].astype(str).str.strip() == contract_id]
+    if match.empty:
+        return {"header": {"template": "orange", "title": {"content": "🔍 未找到", "tag": "plain_text"}},
+                "elements": [{"tag": "markdown", "content": f"未找到合同编号 **{contract_id}**，请确认编号是否正确"}]}
+
+    r = match.iloc[0]
+    status = safe_str(r.get("整体状态", "-"))
+    order_status = safe_str(r.get("订单状态", "-"))
+    ai_ship = safe_str(r.get("AI建议发货时间", ""))[:10]
+    manual_ship = safe_str(r.get("人工确认发货时间", ""))[:10]
+    risk = safe_str(r.get("AI风险", ""))
+    advice = safe_str(r.get("AI建议", ""))
+
+    status_emoji = "🟢" if "有货" in status else "🔴" if "缺货" in status else "⚪"
+    ship_display = manual_ship if manual_ship else ai_ship if ai_ship else "待定"
+
+    lines = [
+        f"📄 **合同 {contract_id}**",
+        "",
+        f"整体状态：{status_emoji} **{status}**",
+        f"订单状态：**{order_status}**",
+        f"预计发货：**{ship_display}**",
+    ]
+    if manual_ship:
+        lines.append(f"人工确认发货时间：**{manual_ship}**")
+    if risk:
+        lines.append(f"AI风险提示：{risk}")
+    if advice:
+        lines.append(f"AI建议：{advice}")
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue", "title": {"content": "📄 订单详情", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+    }
+
+
+def _build_default_card() -> dict:
+    """默认引导卡片。"""
+    return {
+        "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": (
+            "我是供应链AI助手，帮你掌握订单排单和交付全貌。\n\n"
+            "📊 **常用指令**\n"
+            "• **日报** — 今日排单统计\n"
+            "• **库存** — 库存与缺货物料\n"
+            "• **待确认** — 待处理的排单\n"
+            "• **延迟** — 延迟/缺货订单\n"
+            "• **合同编号** — 查具体订单\n\n"
+            "👇 直接输入关键词即可查询"
+        )}],
+    }
+
+
+def _error_card(msg: str) -> dict:
+    return {"header": {"template": "red", "title": {"content": "⚠️ 查询失败", "tag": "plain_text"}},
+            "elements": [{"tag": "markdown", "content": str(msg)}]}
 
 
 @app.post("/webhook/feishu")
@@ -2603,10 +3013,15 @@ async def feishu_webhook(request: Request):
         print("飞书URL验证成功")
         return {"challenge": body["challenge"]}
 
-    # 加密事件检测
+    # 加密事件检测并解密
     if "encrypt" in body:
-        print("[Webhook] 检测到加密事件，需要在飞书开放平台关闭事件加密，或配置 Encrypt Key 解密")
-        return {"msg": "ok"}
+        print("[Webhook] 检测到加密事件，尝试解密...")
+        try:
+            body = _decrypt_event(body["encrypt"])
+            print(f"[Webhook] 解密成功, 字段: {list(body.keys())}")
+        except Exception as e:
+            print(f"[Webhook] 解密失败: {e}")
+            return {"msg": "ok"}
 
     # ---- 解析事件（兼容 V1 和 V2 两种格式） ----
     header = body.get("header", {})
@@ -2653,7 +3068,11 @@ async def feishu_webhook(request: Request):
         user_input = (event.get("text") or "").strip()
         message_id = event.get("open_message_id", "")
 
-    print(f"[Webhook] open_id={open_id[:16] if open_id else '(空)'}..., "
+    # 识别是哪个 App 收到了消息
+    event_app_id = header.get("app_id", "") or event.get("app_id", "")
+    bot_name = _BOT_CREDENTIALS.get(event_app_id, {}).get("name", event_app_id or "未知Bot")
+
+    print(f"[Webhook] app={bot_name}({event_app_id}), open_id={open_id[:16] if open_id else '(空)'}..., "
           f"chat_type={chat_type}, sender_type={sender_type}, message_type={message_type}")
     print(f"[Webhook] text={user_input[:100] if user_input else '(空)'}")
 
@@ -2683,11 +3102,16 @@ async def feishu_webhook(request: Request):
         if len(_seen_webhook_message_ids) > 5000:
             _seen_webhook_message_ids.clear()
 
-    # ---- 处理并回复 ----
+    # ---- 根据 App 路由到不同处理逻辑 ----
     try:
-        from customer_agent import process_message as bot_process_message
-        card = bot_process_message(open_id, user_input)
-        _send_bot_reply(open_id, card)
+        if event_app_id == "cli_a96c5d017d3a1cbb":
+            # 供应链AI助手 → 内部排单/库存/交期管理
+            card = _build_supply_chain_reply(open_id, user_input)
+        else:
+            # 订单查询助手 (cli_aa87f7619df8dbb3) 或未知 → 客户订单查询
+            from customer_agent import process_message as bot_process_message
+            card = bot_process_message(open_id, user_input)
+        _send_bot_reply(open_id, card, app_id=event_app_id)
     except Exception as e:
         print(f"[Webhook] 处理异常: {e}")
         import traceback
