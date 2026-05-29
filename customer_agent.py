@@ -205,7 +205,8 @@ def _load_company_orders(company_name: str) -> List[Dict[str, str]]:
         for item in data.get("data", {}).get("items", []):
             f = item.get("fields", {})
             cust = _parse_feishu_value(f.get("客户名称"))
-            if company_name and _fuzzy_score(company_name, cust) < 0.3:
+            # 公司匹配：放宽阈值到 0.15，避免因飞书企业名与合同客户名细微差异导致漏单
+            if company_name and cust and _fuzzy_score(company_name, cust) < 0.15:
                 continue
             orders.append({
                 "合同编号": _parse_feishu_value(f.get("合同编号")),
@@ -219,17 +220,59 @@ def _load_company_orders(company_name: str) -> List[Dict[str, str]]:
 
 
 def _extract_keywords(user_input: str) -> List[str]:
-    noise = ["帮我", "查一下", "那个", "这个", "什么", "怎么", "进度", "单子",
-             "订单", "一下", "请问", "我想", "我要", "看看", "有没有", "项目"]
+    """智能提取查询关键词：去除口语化噪音，保留项目/设备/交付相关实词。"""
+    # 纯噪音词（完全无信息量的虚词/口语词）
+    noise = ["帮我", "查一下", "那个", "这个", "什么", "怎么", "单子",
+             "一下", "请问", "我想", "我要", "看看", "有没有",
+             "能不能", "可以", "请", "麻烦", "帮忙", "谢谢",
+             "查一查", "查询", "查找"]
+
     cleaned = user_input
     for w in noise:
         cleaned = cleaned.replace(w, " ")
-    tokens = [t.strip() for t in re.split(r"[\s,，、]+", cleaned) if len(t.strip()) >= 2]
-    return tokens[:5]
+
+    # 步骤1：按标点拆分
+    raw_tokens = [t.strip() for t in re.split(r"[\s,，、。！？]+", cleaned) if len(t.strip()) >= 2]
+
+    # 步骤2：对每个 token 做进一步拆分和清洗
+    # 去掉常见口语后缀（发了吗→发，到了没→到，啥时候→空）
+    refined: List[str] = []
+    for tok in raw_tokens:
+        # 去掉口语化后缀（保留核心词）
+        core = re.sub(r"(了吗|了没|没有|没呢|到了吗|啥时候|什么时候|怎么样|的情况|的进度)$", "", tok)
+        if len(core.strip()) >= 2:
+            refined.append(core.strip())
+        # 如果原始 token 包含"项目""设备""系统"等词，保留整个 token
+        if core.strip() != tok and any(w in tok for w in ["项目", "设备", "系统", "工程", "园区", "大楼"]):
+            refined.append(tok.strip())
+
+    # 步骤3：对含中文的长 token（≥4字符）尝试通过常见分隔词拆分
+    extra: List[str] = []
+    for tok in refined:
+        if len(tok) >= 4 and re.search(r"[一-鿿]", tok):
+            # 在"项目""设备""系统""工程""园区"处拆分
+            parts = re.split(r"(项目|设备|系统|工程|园区|大楼|中心|工厂|车站)", tok)
+            for p in parts:
+                p = p.strip()
+                if len(p) >= 2:
+                    extra.append(p)
+    refined.extend(extra)
+
+    # 去重，保留顺序，最多取 8 个
+    seen: set = set()
+    result = []
+    for t in refined:
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result[:8]
 
 
 def _fuzzy_match_orders(orders: List[Dict[str, str]], user_input: str) -> List[Dict[str, Any]]:
+    """多级匹配策略：精确合同号 → 关键词组合 → 整体模糊匹配。"""
     query = user_input.strip().lower()
+
+    # Level 1: 精确合同编号匹配
     exact_contracts = [
         {**order, "_score": 1.0}
         for order in orders
@@ -239,18 +282,48 @@ def _fuzzy_match_orders(orders: List[Dict[str, str]], user_input: str) -> List[D
         return exact_contracts[:1]
 
     keywords = _extract_keywords(user_input)
+
+    # 同时提取更短的关键词（≥1字符，如"医院"、"发"）
+    short_keywords = [t.strip() for t in re.split(r"[\s,，、。！？]+", user_input) if 1 <= len(t.strip()) <= 3]
+
     scored: List[tuple] = []
     for order in orders:
         proj = order.get("项目名称", "")
         contract = order.get("合同编号", "")
+        target = f"{proj} {contract}".lower()
+        proj_lower = proj.lower()
+
+        # 基础分：整体模糊匹配
         score = _fuzzy_score(user_input, f"{proj} {contract}")
+
+        # 加分项 1：关键词命中项目名称
+        keyword_hits = 0
         for kw in keywords:
-            if kw.lower() in proj.lower():
-                score += 0.3
-            if kw.lower() in contract.lower():
+            if len(kw) >= 2 and kw.lower() in proj_lower:
+                keyword_hits += 1
+                score += 0.25
+            elif len(kw) >= 2 and kw.lower() in contract.lower():
                 score += 0.2
-        if score > 0.15:
-            scored.append((min(score, 1.0), {**order, "_score": round(min(score, 1.0), 2)}))
+
+        # 加分项 2：短关键词部分匹配（如"医院"、"写字楼"）
+        for sk in short_keywords:
+            if sk.lower() in proj_lower:
+                score += 0.15
+
+        # 加分项 3：用户查询整体是项目名的子串
+        if query in proj_lower:
+            score += 0.4
+
+        # 加分项 4：关键词较多时给予组合奖励
+        if keyword_hits >= 2:
+            score += 0.2
+        elif keyword_hits >= 3:
+            score += 0.3
+
+        score = min(score, 1.0)
+        if score > 0.12:  # 略降低阈值
+            scored.append((score, {**order, "_score": round(score, 2)}))
+
     scored.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored]
 
@@ -346,26 +419,26 @@ def _build_delivery_card(order: Dict[str, str]) -> dict:
     if status == "缺货":
         status_line = (
             f"关于您关注的【**{project}**】项目（合同编号：{contract}），"
-            f"目前设备正在按计划为您有序排产备货中。"
+            f"目前设备正在按生产计划有序推进，各核心环节均在严格把控之中。"
         )
-        detail_line = "核心模块正在进行严密的出厂前质量验证与软硬件联调测试，确保设备到场后稳定运行。"
+        detail_line = "设备核心模块正在进行出厂前的全面质量验证与联调测试，确保交付后即装即用、稳定运行。"
         if ship_date_raw:
             delivery_line = (
-                f"您的专属交付批次已锁定，我们将确保在 **{ship_date_display}** 为您准时安排发出。"
+                f"您的交付批次已锁定，预计 **{ship_date_display}** 为您准时安排发出。"
             )
         else:
-            delivery_line = "您的专属交付批次确认后，我会第一时间为您同步预计发出时间。"
+            delivery_line = "您的交付批次确认后，我将第一时间为您同步预计发出时间。"
     else:
         status_line = (
             f"关于您关注的【**{project}**】项目（合同编号：{contract}），一切进展顺利。"
         )
-        detail_line = "设备正在完成出厂前的最终调试与防震包装，确保运输安全与到场即用。"
+        detail_line = "设备已完成生产，正在进行出厂前的最终调试与专业防震包装，确保运输安全与到场即用。"
         if ship_date_raw:
             delivery_line = (
-                f"您的专属交付批次已排定，预计 **{ship_date_display}** 为您准时发出。"
+                f"您的交付批次已排定，预计 **{ship_date_display}** 为您准时发出。"
             )
         else:
-            delivery_line = "您的专属交付批次确认后，我会第一时间为您同步预计发出时间。"
+            delivery_line = "您的交付批次确认后，我将第一时间为您同步预计发出时间。"
 
     markdown = (
         f"{status_line}\n\n"
@@ -390,13 +463,66 @@ def _build_simple_card(title: str, text: str, color: str = "red") -> dict:
     }
 
 
-# ===== 闲聊检测 =====
+# ===== 意图分类 =====
 
+# 订单相关关键词（匹配任一即视为订单查询意图）
+_ORDER_KEYWORDS = [
+    r"[A-Za-z0-9\-_]{6,}",            # 合同编号格式
+    r"订单|合同|项目|交期|发货|物流|送货|到货|签收|排产|排单",
+    r"进度|跟踪|状态|批次|在途|运输|发出|收到|到达",
+    r"什么时候.*到|何时.*发|查一下.*单|查.*进度|有没有.*发货",
+    r"单号|编号|查询|查一查|查看|我的.*货|我们的.*单",
+    r"项目|工程|设备|安装|调试|验收",
+    r"合同号|合同.*编号|项目.*名称|发到哪里|走到哪|啥时候",
+    r"帮我.*查|帮我.*看|请问.*订单|请问.*发货",
+]
+
+# 明确非订单相关的内容（闲聊、无关话题）
+_OFF_TOPIC_PATTERNS = [
+    r"^(hi|hello|你好|在吗|嗨|哈喽|hello)[\s!！。.]*$",
+    r"^(早安|午安|晚安|早上好|下午好|晚上好|morning|evening)[\s!！。.]*$",
+    r"^(谢谢|感谢|多谢|好的|ok|okay|收到|知道了|明白|懂了)[\s!！。.]*$",
+    r"^(再见|拜拜|bye|see you|回头见)[\s!！。.]*$",
+    r"^(你是谁|你叫什么|你是什么|你老板|谁做的|机器人)",
+    r"^(今天)?天气|股票|新闻|今天.*星期|几点了|时间",
+    r"^(你会|你能|你可以).*(写代码|聊天|唱歌|讲笑话|干嘛|做什么)",
+    r"价格|多少钱|报价|报价单|优惠|折扣|便宜|议价|定价",
+    r"招聘|面试|工资|待遇|请假|入职",
+    r"^[A-Za-z]{2,10}$",             # 短英文（HAHAH, test, abc 等）
+    r"^(测试|test|ceshi)$",
+]
+
+# 保留的旧闲聊模式（兼容用）
 _CHITCHAT_PATTERNS = [
     r"^(hi|hello|你好|在吗|嗨|哈喽)[\s!！。.]*$",
     r"^(今天)?天气", r"^(你会|你能|你可以).*(写代码|聊天|唱歌|讲笑话)",
     r"^(测试|test)$",
+    r"^(早安|午安|晚安|早上好|下午好|晚上好)$",
+    r"^(谢谢|感谢|好的|ok|okay|收到|知道了)[\s!！。.]*$",
+    r"^(你是谁|你叫什么|你是什么)", r"^(再见|拜拜|bye)$",
+    r"^[A-Za-z]{2,8}$",
 ]
+
+
+def _is_order_related(text: str) -> bool:
+    """判断用户输入是否与订单/交付查询相关。"""
+    cleaned = text.strip()
+    # 消歧序号回复（0-9），直接放行
+    if re.match(r"^[0-9]$", cleaned):
+        return True
+    # 先检查非订单相关模式
+    for pat in _OFF_TOPIC_PATTERNS:
+        if re.search(pat, cleaned, re.IGNORECASE):
+            return False
+    # 检查订单相关关键词
+    for pat in _ORDER_KEYWORDS:
+        if re.search(pat, cleaned, re.IGNORECASE):
+            return True
+    # 包含2个以上中文字符且不匹配无关模式 → 可能是项目名称/订单查询
+    if len(re.findall(r"[一-鿿]", cleaned)) >= 2:
+        return True
+    # 短文本/单字母/纯英文 → 视为无关
+    return False
 
 
 def _is_chitchat(text: str) -> bool:
@@ -411,12 +537,37 @@ def _is_chitchat(text: str) -> bool:
 def process_message(open_id: str, user_input: str) -> dict:
     """处理单条用户消息，返回飞书互动卡片 dict。"""
 
-    # 闲聊拦截
-    if _is_chitchat(user_input):
+    # 第一关：意图分类 — 是否与订单/交付相关
+    if not _is_order_related(user_input):
+        # 礼貌用语（谢谢/好的/收到/再见等）
+        polite_patterns = [
+            r"^(谢谢|感谢|多谢|好的|ok|okay|收到|知道了|明白|懂了)[\s!！。.]*$",
+            r"^(再见|拜拜|bye)[\s!！。.]*$",
+        ]
+        is_polite = any(re.match(p, user_input.strip(), re.IGNORECASE) for p in polite_patterns)
+        if is_polite:
+            return _build_simple_card(
+                "🤖 订单查询助手",
+                "不客气！如需查询订单交付进度或物流信息，请随时告诉我您的**合同编号**或**项目名称**。",
+                "blue",
+            )
+        # 测试/调试
+        if re.match(r"^(测试|test|ceshi)$", user_input.strip(), re.IGNORECASE):
+            return _build_simple_card(
+                "🤖 订单查询助手",
+                "您好，我是订单查询助手，系统运行正常。请发送**合同编号**或**项目名称**查询订单交付进度。",
+                "blue",
+            )
+        # 其他无关内容 → 专业引导
         return _build_simple_card(
-            "🤖 供应链物流管家",
-            "我是您的供应链物流管家，只能帮您查询项目订单交期与物流。请问您的项目名称是什么？",
-            "red",
+            "🤖 订单查询助手",
+            "您好，我是订单查询助手，专注于为您提供订单交付进度与物流信息查询服务。\n\n"
+            "请直接告诉我以下任一信息，我将为您查询最新的交付状态：\n"
+            "• **合同编号**（如 HT-2024-001）\n"
+            "• **项目名称**（如 城市商业综合体消控室项目）\n"
+            "• 输入 **「查一下我的订单进度」**\n\n"
+            "📌 如需价格咨询、技术方案等其他服务，请联系您的专属销售顾问。",
+            "blue",
         )
 
     # 检查是否在消歧会话中（用户回复了序号）
@@ -429,9 +580,17 @@ def process_message(open_id: str, user_input: str) -> dict:
                 detail = _load_order_detail(contract_id)
                 if detail:
                     return _build_delivery_card(detail)
-                return _build_simple_card("📦 暂无数据", "该订单暂无履约数据，请联系销售。", "orange")
+                return _build_simple_card(
+                    "📋 信息确认中",
+                    "该订单的交付计划正在确认中，待批次确认后将第一时间为您同步预计发出时间。如需加急请联系您的专属销售顾问。",
+                    "blue",
+                )
             else:
-                return _build_simple_card("👋 已取消", "如需帮助请联系您的专属销售。", "blue")
+                return _build_simple_card(
+                    "👋 已取消",
+                    "如需进一步查询订单信息，请随时发送项目名称或合同编号。",
+                    "blue",
+                )
         except ValueError:
             pass  # 不是数字，继续正常查询流程
 
@@ -441,26 +600,39 @@ def process_message(open_id: str, user_input: str) -> dict:
     # 加载订单子集。外部联系人可能取不到 company_name，允许用合同号/项目关键词兜底查询。
     orders = _load_company_orders(company or "")
     if not orders:
-        if not company:
+        # 如果有公司身份但公司过滤后为空 → 可能是飞书企业名与合同客户名不一致 → 兜底全量查询
+        if company:
+            orders = _load_company_orders("")
+        if not orders:
+            if not company:
+                return _build_simple_card(
+                    "🔐 身份确认中",
+                    "您好，系统暂未识别到您的企业信息。\n\n"
+                    "请直接发送以下任一信息，我将立即为您查询：\n"
+                    "• **合同编号**（如 HT-2024-001）\n"
+                    "• **项目名称**\n\n"
+                    "收到后我会第一时间为您反馈交付进度。",
+                    "blue",
+                )
             return _build_simple_card(
-                "🔐 身份未识别",
-                "抱歉，未识别到您的企业身份。请直接发送合同编号或项目关键词，我会继续帮您查找。",
-                "orange",
+                "📭 暂无进行中的订单",
+                f"已识别贵司「{company}」，当前系统中暂无进行中的订单。\n\n"
+                "如您已签订新合同但查询不到信息，请联系您的专属销售顾问协助确认。",
+                "blue",
             )
-        return _build_simple_card(
-            "📭 暂无在途订单",
-            f"已识别「{company}」，但当前系统中暂无在途订单。如需帮助请联系销售。",
-            "blue",
-        )
 
     # 第二层：模糊匹配
     candidates = _fuzzy_match_orders(orders, user_input)
     if not candidates:
-        scope_text = f"「{company}」的订单" if company else "当前订单库"
+        scope_text = f"贵司「{company}」的订单" if company else "当前订单库"
         return _build_simple_card(
             "🔍 未找到匹配项目",
-            f"在{scope_text}中未找到与「{user_input}」匹配的项目。请尝试输入合同编号或更完整的项目关键词。",
-            "orange",
+            f"在{scope_text}中未找到与您提供的信息相匹配的订单。\n\n"
+            "建议您尝试：\n"
+            "• 输入完整的**合同编号**（如 HT-2024-001）\n"
+            "• 输入准确的**项目名称**关键词\n\n"
+            "如需其他帮助，请联系您的专属销售顾问。",
+            "blue",
         )
 
     # 第三层：多条消歧
@@ -471,24 +643,33 @@ def process_message(open_id: str, user_input: str) -> dict:
     contract_id = candidates[0]["合同编号"]
     detail = _load_order_detail(contract_id)
     if not detail:
+        proj_name = candidates[0].get("项目名称", "")
         return _build_simple_card(
-            "📦 暂无履约数据",
-            f"找到「{candidates[0].get('项目名称','?')}」，但暂无履约数据。",
-            "orange",
+            "📋 订单信息确认中",
+            f"已找到项目「{proj_name}」，目前该订单的交付计划正在确认中。\n\n"
+            "待交付批次确认后，我将第一时间为您同步预计发出时间。\n\n"
+            "如需加急处理，请联系您的专属销售顾问。",
+            "blue",
         )
     return _build_delivery_card(detail)
 
 
 # ===== 发送回复 =====
 
-def _send_reply(open_id: str, card: dict):
+def _send_reply(open_id: str, card: dict, chat_id: str = "", chat_type: str = ""):
+    """发送回复，群聊自动切换为 chat_id 回复。"""
     token = _get_bot_token()
-    url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+    if chat_type == "group" and chat_id:
+        receive_id_type = "chat_id"
+        receive_id = chat_id
+    else:
+        receive_id_type = "open_id"
+        receive_id = open_id
     resp = httpx.post(
-        url,
+        f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={
-            "receive_id": open_id,
+            "receive_id": receive_id,
             "msg_type": "interactive",
             "content": json.dumps(card, ensure_ascii=False),
         },
@@ -499,21 +680,25 @@ def _send_reply(open_id: str, card: dict):
         raise Exception(f"发送回复失败: {data}")
 
 
-def _extract_message_from_event(event: dict) -> tuple[str, str, str]:
-    """兼容 lark-cli 扁平事件与飞书 V2 envelope，返回 open_id/message_type/text。"""
+def _extract_message_from_event(event: dict) -> tuple:
+    """兼容 lark-cli 扁平事件与飞书 V2 envelope，返回 (open_id, chat_id, chat_type, message_type, text)。"""
     event_id = str(event.get("event_id") or event.get("header", {}).get("event_id") or "")
     if event_id:
         if event_id in _seen_event_ids:
-            return "", "", ""
+            return "", "", "", "", ""
         _seen_event_ids.add(event_id)
 
+    # 公共字段
+    chat_id = str(event.get("chat_id") or "")
+    chat_type = str(event.get("chat_type") or "")
+
     # lark-cli event schema im.message.receive_v1 当前输出为扁平结构：
-    # {sender_id, message_type, content, ...}，其中 content 对 text 已预渲染为纯文本。
+    # {sender_id, message_type, content, chat_id, chat_type, ...}
     if "sender_id" in event or "message_type" in event:
         open_id = str(event.get("sender_id") or "")
         msg_type = str(event.get("message_type") or "text")
         content = event.get("content") or ""
-        return open_id, msg_type, str(content)
+        return open_id, chat_id, chat_type, msg_type, str(content)
 
     payload = event.get("event", {})
     message = payload.get("message", {})
@@ -521,6 +706,9 @@ def _extract_message_from_event(event: dict) -> tuple[str, str, str]:
     open_id = sender.get("open_id", "")
     msg_type = message.get("msg_type", "text")
     content_str = message.get("content", "{}")
+    chat_id_v2 = message.get("chat_id", "")
+    if not chat_id and chat_id_v2:
+        chat_id = chat_id_v2
 
     try:
         content = json.loads(content_str)
@@ -535,7 +723,15 @@ def _extract_message_from_event(event: dict) -> tuple[str, str, str]:
             for elem in block:
                 if elem.get("tag") == "text":
                     user_input += elem.get("text", "")
-    return open_id, msg_type, user_input
+    return open_id, chat_id, chat_type, msg_type, user_input
+
+
+def _strip_at_mention(text: str) -> str:
+    """移除群聊中的 @ 提及（@所有人、@机器人等），返回纯净用户输入。"""
+    import re as _re
+    t = _re.sub(r"@\S+", "", text).strip()
+    t = _re.sub(r"@所有人", "", t).strip()
+    return t
 
 
 # ===== 双 App 长连接事件主循环 =====
@@ -565,14 +761,20 @@ def _get_main_app_token() -> str:
     return token
 
 
-def _send_main_app_reply(open_id: str, card: dict):
-    """以供应链AI助手身份发送回复。"""
+def _send_main_app_reply(open_id: str, card: dict, chat_id: str = "", chat_type: str = ""):
+    """以供应链AI助手身份发送回复，群聊自动切换为 chat_id 回复。"""
     token = _get_main_app_token()
+    if chat_type == "group" and chat_id:
+        receive_id_type = "chat_id"
+        receive_id = chat_id
+    else:
+        receive_id_type = "open_id"
+        receive_id = open_id
     resp = httpx.post(
-        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+        f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={
-            "receive_id": open_id,
+            "receive_id": receive_id,
             "msg_type": "interactive",
             "content": json.dumps(card, ensure_ascii=False),
         },
@@ -587,7 +789,7 @@ def _send_main_app_reply(open_id: str, card: dict):
 
 def _run_event_loop(lark_cli_path: str, profile_args: List[str], label: str,
                     handler_func, reply_func):
-    """单个 App 的事件消费循环（在独立线程中运行）。"""
+    """单个 App 的事件消费循环（在独立线程中运行），同时支持 p2p 和群聊。"""
     print(f"[{label}] 启动长连接...")
 
     while True:
@@ -631,8 +833,9 @@ def _run_event_loop(lark_cli_path: str, profile_args: List[str], label: str,
                 time.sleep(5)
                 continue
 
-            print(f"[{label}] 就绪，接收事件中")
+            print(f"[{label}] 就绪，接收事件中（支持 p2p + 群聊）")
 
+            _msg_count = 0
             for line in iter(proc.stdout.readline, ""):
                 stripped = line.strip()
                 if not stripped:
@@ -643,27 +846,36 @@ def _run_event_loop(lark_cli_path: str, profile_args: List[str], label: str,
                     continue
 
                 chat_type = event.get("chat_type", "")
-                if chat_type != "p2p":
+                # 支持 p2p 和 group 两种聊天类型
+                if chat_type not in ("p2p", "group"):
                     continue
 
-                open_id, msg_type, user_input = _extract_message_from_event(event)
+                open_id, chat_id, _ct, msg_type, user_input = _extract_message_from_event(event)
                 if not open_id or not user_input.strip():
                     continue
                 if msg_type != "text":
                     continue
 
+                # 群聊中剥离 @提及
+                if chat_type == "group":
+                    user_input = _strip_at_mention(user_input)
+                    if not user_input.strip():
+                        continue
+
+                _msg_count += 1
                 now_str = datetime.now(CST).strftime("%H:%M:%S")
-                print(f"[{label}] {now_str} {open_id[:12]}...: {user_input[:60]}")
+                chat_label = "群聊" if chat_type == "group" else "私聊"
+                print(f"[{label}] {now_str} [{chat_label}] #{_msg_count} {open_id[:12]}...: {user_input[:60]}")
 
                 try:
                     card = handler_func(open_id, user_input)
-                    reply_func(open_id, card)
+                    reply_func(open_id, card, chat_id=chat_id, chat_type=chat_type)
                     print(f"[{label}]  -> 已回复")
                 except Exception as e:
                     print(f"[{label}]  [X] 处理异常: {e}")
 
             ret = proc.wait()
-            print(f"[{label}] 进程退出 (code={ret})，5秒后重连...")
+            print(f"[{label}] 进程退出 (code={ret})，本会话收到 {_msg_count} 条消息，5秒后重连...")
             time.sleep(5)
 
         except Exception as e:
@@ -673,8 +885,149 @@ def _run_event_loop(lark_cli_path: str, profile_args: List[str], label: str,
             time.sleep(5)
 
 
+# ===== 飞书文档扫描与 AI 加工 =====
+
+_FEISHU_DOC_URL_RE = re.compile(
+    r"https?://[^\s/]+\.(feishu|lark)\.(cn|com)/(docx|wiki|minutes)/([A-Za-z0-9_\-]+)",
+    re.IGNORECASE,
+)
+
+_DEEPSEEK_CLIENT_CACHE: Any = None
+
+
+def _get_deepseek_client():
+    global _DEEPSEEK_CLIENT_CACHE
+    if _DEEPSEEK_CLIENT_CACHE is None:
+        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        if api_key:
+            from openai import OpenAI
+            _DEEPSEEK_CLIENT_CACHE = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    return _DEEPSEEK_CLIENT_CACHE
+
+
+def _scan_feishu_doc(doc_url: str) -> Optional[str]:
+    """通过 lark-cli 读取飞书文档的完整文本内容。支持 docx/wiki/minutes。"""
+    # 拆分 URL 获取 token
+    corpus = doc_url.split("?")[0]
+    parts = corpus.rstrip("/").split("/")
+    if len(parts) < 2:
+        return None
+    token = parts[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", token):
+        return None
+
+    lark_cli = _find_lark_cli()
+
+    # 读取文档纯文本
+    try:
+        result = subprocess.run(
+            [lark_cli, "--profile", "main-app", "docs", "+fetch", "--token", token, "--format", "text"],
+            capture_output=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        if result.returncode != 0:
+            err = result.stderr.strip() or result.stdout.strip()
+            print(f"  [文档扫描] lark-cli 读取失败: {err[:200]}")
+            return None
+        content = result.stdout.strip()
+        if content and len(content) >= 10:
+            return content
+    except subprocess.TimeoutExpired:
+        print(f"  [文档扫描] lark-cli 读取超时")
+    except Exception as e:
+        print(f"  [文档扫描] 异常: {e}")
+    return None
+
+
+def _ai_process_doc(content: str, user_question: str) -> str:
+    """用 DeepSeek 对文档内容进行加工，回答用户问题或生成摘要。"""
+    client = _get_deepseek_client()
+    if client is None:
+        return "（文档已读取，但 DeepSeek API Key 未配置，无法智能加工）"
+
+    # 截断超长文档，保留前 12000 字符
+    truncated = content[:12000]
+    if len(content) > 12000:
+        truncated += "\n\n（文档较长，以上为节选）"
+
+    prompt = f"""你是供应链文档分析助手。根据以下飞书文档内容，回答用户的问题。
+
+用户问题：{user_question}
+
+文档内容：
+{truncated}
+
+要求：
+1. 回答控制在 200-400 字
+2. 如果文档内容与问题不相关，如实告知
+3. 关键数字和数据要原样引用，不要编造
+4. 用 Markdown 格式输出，适当使用粗体和列表"""
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=2048,
+            timeout=60,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"（AI 加工失败: {e}）\n\n文档原文摘要：{truncated[:500]}..."
+
+
+def _handle_doc_scan(user_input: str) -> Optional[dict]:
+    """检测消息中是否包含飞书文档链接，如是则读取并加工后返回卡片。"""
+    match = _FEISHU_DOC_URL_RE.search(user_input)
+    if not match:
+        return None
+
+    doc_url = match.group(0)
+    print(f"  [文档扫描] 检测到飞书文档: {doc_url}")
+
+    # 提取用户的具体问题（去掉 URL 后的剩余文本）
+    question = _FEISHU_DOC_URL_RE.sub("", user_input).strip()
+    if not question or len(question) < 2:
+        question = "请总结这份文档的核心内容和关键数据"
+
+    # 读取文档
+    content = _scan_feishu_doc(doc_url)
+    if content is None:
+        return {
+            "header": {"template": "red", "title": {"content": "📄 文档读取失败", "tag": "plain_text"}},
+            "elements": [{"tag": "markdown", "content": (
+                f"无法读取该飞书文档：{doc_url}\n\n"
+                "可能原因：\n"
+                "• 文档权限限制（需确保供应链AI助手有访问权限）\n"
+                "• 链接格式不正确\n"
+                "• 文档类型暂不支持\n\n"
+                "请确认文档链接或尝试发送文档内容截图。"
+            )}],
+        }
+
+    print(f"  [文档扫描] 文档长度: {len(content)} 字符")
+
+    # AI 加工
+    result = _ai_process_doc(content, question)
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue", "title": {"content": "📄 文档智能分析", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": result}],
+    }
+
+
 def _supply_chain_handler(open_id: str, user_input: str) -> dict:
-    """供应链AI助手消息处理（延迟导入 scheduler_api 模块以复用逻辑）。"""
+    """供应链AI助手消息处理（延迟导入 scheduler_api 模块以复用逻辑）。
+
+    优先检测飞书文档链接，其次交给 scheduler_api 做供应链关键词匹配。
+    """
+    # 飞书文档扫描优先
+    doc_card = _handle_doc_scan(user_input)
+    if doc_card is not None:
+        return doc_card
+
     try:
         from scheduler_api import _build_supply_chain_reply
         return _build_supply_chain_reply(open_id, user_input)
@@ -683,7 +1036,10 @@ def _supply_chain_handler(open_id: str, user_input: str) -> dict:
         return {
             "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
             "elements": [{"tag": "markdown", "content": (
-                "我是供应链AI助手。\n\n📊 发送 **日报** / **库存** / **待确认** / **延迟** 查询相关信息\n🔍 发送**合同编号**查询订单详情"
+                "我是供应链AI助手。\n\n"
+                "📊 发送 **日报** / **库存** / **待确认** / **延迟** 查询相关信息\n"
+                "🔍 发送**合同编号**查询订单详情\n"
+                "📄 发送**飞书文档链接**让我帮你分析和总结文档内容"
             )}],
         }
 
@@ -698,6 +1054,23 @@ def main():
 
     lark_cli = _find_lark_cli()
     print(f"  lark-cli: {lark_cli}")
+    print(f"  支持消息类型: 私聊(p2p) + 群聊(group)")
+    print(f"  飞书文档扫描: 已启用（docx/wiki/minutes）")
+
+    # 事件订阅诊断
+    try:
+        result = subprocess.run(
+            [lark_cli, "event", "status"], capture_output=True, encoding="utf-8", timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            print(f"\n  [诊断] 事件总线状态:")
+            for line in result.stdout.strip().split("\n")[:8]:
+                if line.strip():
+                    print(f"    {line.strip()}")
+            print()
+    except Exception:
+        pass
+
     print("[OK] 启动双路长连接，等待消息...\n")
 
     # 订单查询助手（默认 profile = 客服机器人）

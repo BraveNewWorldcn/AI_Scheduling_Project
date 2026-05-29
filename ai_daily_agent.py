@@ -231,7 +231,7 @@ def fetch_latest_record() -> Dict[str, str]:
         "库存充足SKU数":      _parse_feishu_value(fields.get("库存充足SKU数")),
         "库存预警SKU数":      _parse_feishu_value(fields.get("库存预警SKU数")),
         "库存缺货SKU数":      _parse_feishu_value(fields.get("库存缺货SKU数")),
-        "最紧缺SKU":          _parse_feishu_value(fields.get("最紧缺SKU")),
+        "库存缺货统计":      _parse_feishu_value(fields.get("库存缺货统计")),
         "最紧缺SKU缺口":      _parse_feishu_value(fields.get("最紧缺SKU缺口")),
         "最长交期订单":       _parse_feishu_value(fields.get("最长交期订单")),
         "最晚发货日期":       _parse_feishu_value(fields.get("最晚发货日期")),
@@ -244,7 +244,7 @@ def fetch_latest_record() -> Dict[str, str]:
 
     # 补默认值：飞书空单元格可能字段不存在
     for key, default in [
-        ("最紧缺SKU", "无"),
+        ("库存缺货统计", "无"),
         ("最紧缺SKU缺口", "0"),
         ("今日预计延迟订单数", "0"),
     ]:
@@ -467,7 +467,7 @@ def generate_daily_report(record: Dict[str, str]) -> tuple:
 
 📦 **三、物料风险**
 - 库存健康率 {health_rate}%（充足 {sufficient_sku} / 预警 {warning_sku} / 缺货 {shortage_sku}）。
-- { "当前物料充足。" if shortage_sku == 0 else f"缺货率 {shortage_pct}%，最紧缺为「{record.get('最紧缺SKU','?')}」，缺口 {record.get('最紧缺SKU缺口','?')} 个。建议采购优先补货。" }
+- { "当前物料充足。" if shortage_sku == 0 else f"缺货率 {shortage_pct}%，最紧缺为「{(record.get('库存缺货统计','?') or '?').split(chr(10))[0]}」。建议采购优先补货。" }
 
 🔮 **四、未来 72h 预测**
 - 未来3天应发 {record.get('未来3天应发货订单数','0')} 单，缺货风险 {future_short} 单。
@@ -618,8 +618,8 @@ def maybe_create_followup_task(record: Dict[str, str], doc_url: str) -> bool:
     if delay <= 0:
         return False
 
-    shortage_sku = record.get("最紧缺SKU", "无") or "无"
-    shortage_gap = record.get("最紧缺SKU缺口", "0") or "0"
+    shortage_full = record.get("库存缺货统计", "无") or "无"
+    shortage_sku = shortage_full.split('\n')[0] if '\n' in shortage_full else shortage_full
 
     # 截止时间：明天 12:00 CST
     tomorrow = datetime.now(CST) + timedelta(days=1)
@@ -629,8 +629,7 @@ def maybe_create_followup_task(record: Dict[str, str], doc_url: str) -> bool:
 
     description = (
         f"今日预计延迟订单数：{delay} 单\n"
-        f"最紧缺SKU：{shortage_sku}\n"
-        f"最紧缺SKU缺口：{shortage_gap}\n"
+        f"最紧缺物料：{shortage_sku}\n"
         f"日报链接：{doc_url}\n"
         f"\n请尽快跟进处理延期订单。"
     )
@@ -863,9 +862,9 @@ def _build_shortage_brief_list(report: Dict[str, str], top_sku: str) -> str:
     if briefs:
         return " | ".join(briefs[:6])
 
-    top = top_sku or report.get("最紧缺SKU", "")
-    gap = report.get("最紧缺SKU缺口", "0")
-    return f"{top}(缺{gap})" if top and top != "无" else "暂无其他断供项"
+    top_raw = top_sku or report.get("库存缺货统计", "")
+    top = top_raw.split('\n')[0] if '\n' in (top_raw or '') else (top_raw or '')
+    return top if top and top != "无" else "暂无其他断供项"
 
 
 def _estimate_lead_time_days(report: Dict[str, str]) -> str:
@@ -915,8 +914,8 @@ def _boss_ai_insight(report: Dict[str, str], color: str, lead_time: str, hunger_
 def _build_procurement_card(report: Dict[str, str]) -> dict:
     """Track 1 - 采购/物料产协群：基于业务影响施压，而不是罗列系统数字。"""
     batch = report.get("排单批次号", "-")
-    top_sku = report.get("最紧缺SKU", "无")
-    top_gap = report.get("最紧缺SKU缺口", "0")
+    top_raw = report.get("库存缺货统计", "无") or "无"
+    top_sku = top_raw.split('\n')[0] if '\n' in top_raw else top_raw
     shortage_sku = _safe_int(report.get("库存缺货SKU数", "0"))
     shortage_item = _pick_shortage_item(report, top_sku)
     business_impact = _shortage_business_impact(report, shortage_item)
@@ -939,7 +938,7 @@ def _build_procurement_card(report: Dict[str, str]) -> dict:
     )
     material_spotlight = (
         "🧨 **最紧急物料特写**\n"
-        f"**断供物料**：<font color='red'>**{top_sku}**</font>（缺口 **{top_gap}**）\n"
+        f"**断供物料**：<font color='red'>**{top_sku}**</font>\n"
         f"**💥 爆炸半径**：<font color='red'>**{business_impact}**</font>\n"
         f"**⏳ SLA 倒计时**：{sla_display}（最晚发货日：{_format_short_date(latest_ship_date)}）"
     )
@@ -1036,8 +1035,8 @@ def _build_boss_card(report: Dict[str, str]) -> dict:
     delay = report.get("今日预计延迟订单数", "0")
     shortage_sku = report.get("库存缺货SKU数", "0")
     future_short = report.get("未来3天缺货订单数", "0")
-    top_sku = report.get("最紧缺SKU", "无")
-    top_gap = report.get("最紧缺SKU缺口", "0")
+    top_raw = report.get("库存缺货统计", "无") or "无"
+    top_sku = top_raw.split('\n')[0] if '\n' in top_raw else top_raw
     lead_time = _estimate_lead_time_days(report)
     hunger_days = _estimate_capacity_hunger_days(report)
     dashboard_url = os.getenv("BITABLE_DASHBOARD_URL", "")
@@ -1066,7 +1065,7 @@ def _build_boss_card(report: Dict[str, str]) -> dict:
             "⚠️ **风险阻断区**\n"
             f"当前有 <font color='red'>**{shortage_sku} 个核心物料断供**</font>，"
             f"阻断 **{blocked}** 个重点交付窗口；最紧缺为 "
-            f"<font color='red'>**{top_sku}**</font>（缺口 **{top_gap}**）。"
+            f"<font color='red'>**{top_sku}**</font>。"
         )
     footer_markdown = (
         f"订单资产池：**{total}** 单。"

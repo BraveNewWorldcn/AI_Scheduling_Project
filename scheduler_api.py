@@ -5,7 +5,7 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, Form
 import os
 import re
 import time
@@ -287,8 +287,14 @@ def _norm_match_key(s: str) -> str:
     return t.lower()
 
 
+# 通用/低价值 token：词频高但匹配价值低，从倒排索引中过滤
+_COMMON_TOKENS = {
+    "定制", "外购", "外协", "设备", "系统", "装置", "终端", "模块", "配件", "组件",
+    "产品", "服务", "工程", "项目", "通用", "标准", "默认", "其他", "备用",
+}
+
 def _tokenize_device_text(text: str) -> List[str]:
-    """将设备型号/名称拆分为关键词（≥2字符），用于倒排索引。"""
+    """将设备型号/名称拆分为关键词（≥2字符），过滤通用词。"""
     tokens: List[str] = []
     raw = safe_str(text)
     if not raw:
@@ -296,10 +302,10 @@ def _tokenize_device_text(text: str) -> List[str]:
     parts = re.split(r"[/\-\s,　，、]+", raw)
     for part in parts:
         part = part.strip()
-        if len(part) >= 2:
+        if len(part) >= 2 and part.lower() not in _COMMON_TOKENS:
             tokens.append(part.lower())
             norm = part.replace("（", "(").replace("）", ")").lower()
-            if norm != part.lower():
+            if norm != part.lower() and norm not in _COMMON_TOKENS:
                 tokens.append(norm)
     return tokens
 
@@ -379,7 +385,23 @@ def _inv_lookup_by_tokens(text: str) -> List[Dict[str, Any]]:
         key=lambda x: (x[1], to_num(x[0].get("库存数量", 0))),
         reverse=True,
     )
-    return [c[0] for c in sorted_candidates[: _inv_max_results]]
+    # 最低质量检查：得分≥2 或 查询文本是匹配设备名称的子串
+    result = []
+    query_lower = text.lower().strip()
+    for c in sorted_candidates[: _inv_max_results]:
+        score = c[1]
+        rec = c[0]
+        if score >= 2:
+            result.append(rec)
+        elif score == 1 and len(query_lower) >= 3:
+            # 单 token 匹配时，检查查询文本是否是设备名称/型号的子串
+            dev_texts = [
+                safe_str(rec.get(k, "")).lower()
+                for k in ("国网设备名称", "国网设备型号", "设备名称", "设备型号")
+            ]
+            if any(query_lower in dt for dt in dev_texts if len(dt) >= 3):
+                result.append(rec)
+    return result
 
 
 def _is_generic_spec_text(t: str) -> bool:
@@ -400,22 +422,25 @@ def find_inventory_row(
     row_dict: Dict[str, Any],
     inv: pd.DataFrame,
     sku_df: Optional[pd.DataFrame] = None,
-) -> Tuple[Optional[Dict[str, Any]], str]:
+) -> Tuple[Optional[Dict[str, Any]], str, str]:
     """在库存快照中查找对应行（优先走预建索引，O(1)/O(k)）。
+
+    返回 (matched_row, match_description, canonical_sku)
+    canonical_sku 是库存表中该产品的权威 SKU 编码，用于统一跨订单的库存追踪。
 
     1) 先按 SKU 精确索引查找
     2) 通过 SKU标准表拿到设备型号/名称 → 倒排索引查找
-    3) 按明细的规格/产品名称 → 倒排索引查找
+    3) 按明细的规格/产品名称 → 倒排索引查找（含验证）
     """
     if inv is None or inv.empty:
-        return None, "库存表为空"
+        return None, "库存表为空", safe_str(sku_code)
 
     code = safe_str(sku_code)
 
     # 1) 精确索引 O(1)
     hit = _inv_lookup_exact(code)
     if hit is not None:
-        return hit, "SKU列匹配(索引)"
+        return hit, "SKU列匹配(索引)", safe_str(hit.get("SKU", code))
 
     # 2) 经 SKU 主数据拿到型号/名称再匹配
     if sku_df is not None and not sku_df.empty and "产品编码SKU" in sku_df.columns and code:
@@ -430,7 +455,7 @@ def find_inventory_row(
                     continue
                 candidates = _inv_lookup_by_tokens(t)
                 for c in candidates:
-                    return c, f"SKU标准表.{key}→倒排索引({t[:40]})"
+                    return c, f"SKU标准表.{key}→倒排索引({t[:40]})", safe_str(c.get("SKU", code))
 
     # 3) 按明细规格/产品名称 → 倒排索引
     texts: List[str] = []
@@ -444,9 +469,11 @@ def find_inventory_row(
     for text in texts:
         candidates = _inv_lookup_by_tokens(text)
         if candidates:
-            return candidates[0], f"倒排索引匹配({text[:40]})"
+            matched = candidates[0]
+            matched_sku = safe_str(matched.get("SKU", ""))
+            return matched, f"倒排索引匹配({text[:40]})", matched_sku or code
 
-    return None, f"未匹配(SKU编码={code!r}, 规格={safe_str(row_dict.get('规格', ''))[:40]!r})"
+    return None, f"未匹配(SKU编码={code!r}, 规格={safe_str(row_dict.get('规格', ''))[:40]!r})", safe_str(sku_code)
 
 
 # =========================
@@ -615,13 +642,10 @@ def write_df_to_bitable(
     *,
     numeric_cols: Optional[set] = None,
     date_cols: Optional[set] = None,
-):
-    """批量写入飞书多维表格（使用批量创建 API，每批 ≤500 条）。
-
-    禁止在 iterrows 循环内发起 HTTP 请求。
-    """
+) -> int:
+    """批量写入飞书多维表格。返回成功写入的记录数。失败返回 -1。"""
     if df is None or df.empty:
-        return
+        return 0
 
     numeric_fields = set(numeric_cols or set())
     date_fields = set(date_cols or set())
@@ -630,6 +654,7 @@ def write_df_to_bitable(
     url = f"{FEISHU_BITABLE_BASE}/tables/{table_id}/records/batch_create"
 
     records_batch: List[Dict[str, Any]] = []
+    success_count = 0
 
     for _, row in df.iterrows():
         fields = _build_fields_dict(row, columns, fields_map, numeric_fields, date_fields)
@@ -637,11 +662,15 @@ def write_df_to_bitable(
             records_batch.append({"fields": fields})
 
         if len(records_batch) >= BATCH_SIZE:
-            _post_batch(url, headers, records_batch, "创建")
+            if _post_batch(url, headers, records_batch, "创建"):
+                success_count += len(records_batch)
             records_batch.clear()
 
     if records_batch:
-        _post_batch(url, headers, records_batch, "创建")
+        if _post_batch(url, headers, records_batch, "创建"):
+            success_count += len(records_batch)
+
+    return success_count
 
 
 def update_bitable_records(
@@ -693,17 +722,20 @@ def update_bitable_records(
         _post_batch(url, headers, records_batch, "更新")
 
 
-def _post_batch(url: str, headers: Dict[str, str], records: List[Dict[str, Any]], action: str):
-    """发送一批记录到飞书批量 API。"""
+def _post_batch(url: str, headers: Dict[str, str], records: List[Dict[str, Any]], action: str) -> bool:
+    """发送一批记录到飞书批量 API。返回 True 表示成功。"""
     try:
         resp = httpx.post(url, headers=headers, json={"records": records}, timeout=60.0)
         data = _safe_http_json(resp, f"批量{action}")
         if data.get("code") != 0:
-            print(f"批量{action}失败: {data}")
+            print(f"批量{action}失败: code={data.get('code')}, msg={data.get('msg')}")
+            return False
         else:
             print(f"批量{action}成功: {len(records)} 条")
+            return True
     except Exception as e:
         print(f"批量{action}异常: {str(e)}")
+        return False
 
 
 def upsert_bitable_records_by_key(
@@ -797,8 +829,8 @@ def load_data():
         required_sku_cols = ["产品编码SKU", "标准生产周期"]
         optional_sku_cols = ["设备名称", "设备型号", "是否新产品", "是否自研", "是否外采"]
 
-        required_inv_cols = ["库存日期", "SKU", "库存数量"]
-        optional_inv_cols = ["国网设备名称", "国网设备型号", "待采购出库", "在途数量", "数据来源", "导入批次号"]
+        required_inv_cols = ["SKU", "库存数量"]
+        optional_inv_cols = ["库存日期", "国网设备名称", "国网设备型号", "待采购出库", "在途数量", "数据来源", "导入批次号"]
 
         def check_columns(df, table_name, required_cols, optional_cols=None):
             optional_cols = optional_cols or []
@@ -979,6 +1011,111 @@ def sku_supply_type_from_sku_row(sku_row: Dict[str, Any]) -> str:
 
 
 # =========================
+# SKU 自动生成规则
+# =========================
+SKU_PREFIX_RULES: List[Tuple[str, str, str]] = [
+    # (关键词, 前缀, 设备分类) —— 长关键词优先匹配
+    ("消控室值班助手", "RB8-", "消控室值班助手"),
+    ("消防广播",       "RB8-", "消防广播"),
+    ("采集传输终端",   "TX-CJ-", "采集传输终端"),
+    ("用户信息传输装置", "TX-YH-", "用户信息传输装置"),
+    ("主机通讯板",     "XF-TX-", "主机通讯板"),
+    ("物联网卡",       "FW-", "物联网卡"),
+    ("控制柜远程控制", "XF-YK-", "控制柜远程控制"),
+]
+
+
+def generate_sku_for_product(
+    product_name: str,
+    spec: str,
+    sku_df: pd.DataFrame,
+) -> Optional[str]:
+    """根据产品名称和规格自动生成 SKU 编码。
+
+    按 SKU_PREFIX_RULES 匹配产品名称关键词 → 确定前缀 →
+    扫描 SKU 标准表中该前缀下的最大序号 → 生成 prefix+next_number。
+    """
+    search_text = f"{safe_str(product_name)} {safe_str(spec)}".lower()
+
+    # 按规则表匹配（长关键词优先）
+    matched_prefix = None
+    matched_category = None
+    for keyword, prefix, category in SKU_PREFIX_RULES:
+        if keyword in search_text:
+            matched_prefix = prefix
+            matched_category = category
+            break
+
+    if not matched_prefix:
+        return None
+
+    # 扫描 SKU 标准表中该前缀下的现有序号
+    max_num = 0
+    if sku_df is not None and not sku_df.empty and "产品编码SKU" in sku_df.columns:
+        for sku_code in sku_df["产品编码SKU"].astype(str):
+            sku_str = safe_str(sku_code)
+            if sku_str.startswith(matched_prefix):
+                suffix = sku_str[len(matched_prefix):]
+                try:
+                    num = int(suffix)
+                    max_num = max(max_num, num)
+                except ValueError:
+                    pass
+
+    next_num = max_num + 1
+    if next_num > 999:
+        # 序号溢出 → 用产品名 hash 作为后缀
+        import hashlib
+        hash_suffix = hashlib.md5(safe_str(product_name).encode()).hexdigest()[:4].upper()
+        return f"{matched_prefix}{hash_suffix}"
+
+    return f"{matched_prefix}{next_num:03d}"
+
+
+def ensure_sku_in_standard_table(
+    sku_code: str,
+    device_name: str,
+    is_new: bool,
+    sku_df: pd.DataFrame,
+) -> bool:
+    """确保 SKU 在标准表中存在，不存在则创建。
+
+    返回 True 表示 SKU 已存在或创建成功。
+    """
+    if not sku_code:
+        return False
+
+    # 检查是否已存在
+    if sku_df is not None and not sku_df.empty and "产品编码SKU" in sku_df.columns:
+        existing = sku_df[sku_df["产品编码SKU"].astype(str).apply(safe_str) == safe_str(sku_code)]
+        if not existing.empty:
+            return True
+
+    # 不存在 → 创建
+    try:
+        now_str = datetime.now().strftime("%Y-%m-%d")
+        new_row = {
+            "产品编码SKU": safe_str(sku_code),
+            "设备名称": safe_str(device_name),
+            "标准生产周期": 15 if is_new else 25,
+            "是否新产品": "是" if is_new else "",
+            "是否自研": "",
+            "是否外采": "",
+        }
+        new_df = pd.DataFrame([new_row])
+        write_df_to_bitable(
+            TABLE_ID_SKU,
+            new_df,
+            numeric_cols={"标准生产周期"},
+        )
+        print(f"[SKU自动创建] {sku_code} ({device_name}) {'新产品' if is_new else '补全'} → SKU标准表")
+        return True
+    except Exception as e:
+        print(f"[SKU自动创建失败] {sku_code}: {e}")
+        return False
+
+
+# =========================
 # 库存计算
 # =========================
 def calc_available_stock(inv_row: Optional[Dict[str, Any]], reserved_qty: float = 0.0) -> float:
@@ -1005,15 +1142,23 @@ def calc_shortage_eta_date(
     sku_code: str,
     sku_df: pd.DataFrame,
     base_date: date,
+    in_inventory: bool = True,
 ) -> date:
-    match = sku_df[sku_df["产品编码SKU"] == sku_code] if (sku_df is not None and not sku_df.empty) else pd.DataFrame()
-    if match.empty:
-        cycle = 25
+    """计算缺货 SKU 的预计到货日期。
+
+    in_inventory=False 表示该产品在库存表中不存在，视为新产品，生产周期 15 天。
+    """
+    if not in_inventory:
+        cycle = 15
     else:
-        sku_info = match.iloc[0].to_dict()
-        cycle = to_num(sku_info.get("标准生产周期", 0))
-        if cycle <= 0:
+        match = sku_df[sku_df["产品编码SKU"] == sku_code] if (sku_df is not None and not sku_df.empty) else pd.DataFrame()
+        if match.empty:
             cycle = 25
+        else:
+            sku_info = match.iloc[0].to_dict()
+            cycle = to_num(sku_info.get("标准生产周期", 0))
+            if cycle <= 0:
+                cycle = 25
 
     final_date = add_calendar_days_then_working_day(base_date, int(cycle))
     return final_date
@@ -1260,7 +1405,12 @@ def prepare_summary_status(summary: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def summarize_confirmed_stock(summary: pd.DataFrame, detail: pd.DataFrame) -> Dict[str, float]:
+def summarize_confirmed_stock(
+    summary: pd.DataFrame,
+    detail: pd.DataFrame,
+    inv: Optional[pd.DataFrame] = None,
+    sku_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, float]:
     locked_stock: Dict[str, float] = {}
     summary = prepare_summary_status(summary)
     if summary.empty or detail is None or detail.empty or "合同编号" not in detail.columns:
@@ -1280,9 +1430,19 @@ def summarize_confirmed_stock(summary: pd.DataFrame, detail: pd.DataFrame) -> Di
     locked_detail = source[source["合同编号"].isin(confirmed_contracts)]
     for _, r in locked_detail.iterrows():
         sku_code = safe_str(r.get("SKU编码", ""))
+        if not sku_code:
+            sku_code = safe_str(r.get("产品名称", "")) or safe_str(r.get("规格", ""))
         qty = to_num(r.get("合同数量", 0))
         if sku_code and qty > 0:
-            locked_stock[sku_code] = locked_stock.get(sku_code, 0.0) + qty
+            # Canonicalize SKU key via inventory matching
+            if inv is not None and not inv.empty:
+                _, _, canon_key = find_inventory_row(
+                    sku_code, r.to_dict(), inv, sku_df=sku_df
+                )
+                canon_key = canon_key or sku_code
+            else:
+                canon_key = sku_code
+            locked_stock[canon_key] = locked_stock.get(canon_key, 0.0) + qty
     return locked_stock
 
 
@@ -1293,7 +1453,11 @@ def get_confirmed_contract_ids(summary: pd.DataFrame) -> set:
     return set(summary.loc[summary["订单状态"] == "已确认", "合同编号"].astype(str).apply(safe_str))
 
 
-def summarize_effective_reservations(reservations: pd.DataFrame) -> Dict[str, float]:
+def summarize_effective_reservations(
+    reservations: pd.DataFrame,
+    inv: Optional[pd.DataFrame] = None,
+    sku_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, float]:
     reserved_stock: Dict[str, float] = {}
     if reservations is None or reservations.empty:
         return reserved_stock
@@ -1305,7 +1469,16 @@ def summarize_effective_reservations(reservations: pd.DataFrame) -> Dict[str, fl
         sku_code = safe_str(r.get("SKU", ""))
         qty = to_num(r.get("预留数量", 0))
         if sku_code and qty > 0:
-            reserved_stock[sku_code] = reserved_stock.get(sku_code, 0.0) + qty
+            # Canonicalize SKU key via inventory matching
+            # Pass sku_code as both 产品名称 and 规格 to maximize inverted index match surface
+            if inv is not None and not inv.empty:
+                _, _, canon_key = find_inventory_row(
+                    sku_code, {"产品名称": sku_code, "规格": sku_code}, inv, sku_df=sku_df
+                )
+                canon_key = canon_key or sku_code
+            else:
+                canon_key = sku_code
+            reserved_stock[canon_key] = reserved_stock.get(canon_key, 0.0) + qty
     return reserved_stock
 
 
@@ -1371,7 +1544,13 @@ def release_old_contract_reservations(reservations: pd.DataFrame, contract_ids: 
     return update_reservation_records(active, "已过期", "新一轮排单覆盖")
 
 
-def build_reservation_rows(summary: pd.DataFrame, detail: pd.DataFrame, batch_id: str) -> pd.DataFrame:
+def build_reservation_rows(
+    summary: pd.DataFrame,
+    detail: pd.DataFrame,
+    batch_id: str,
+    inv: Optional[pd.DataFrame] = None,
+    sku_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     if summary is None or summary.empty or detail is None or detail.empty:
         return pd.DataFrame()
     summary = prepare_summary_status(summary)
@@ -1391,18 +1570,28 @@ def build_reservation_rows(summary: pd.DataFrame, detail: pd.DataFrame, batch_id
     for _, r in source[source["合同编号"].isin(pending_contracts)].iterrows():
         contract_id = safe_str(r.get("合同编号", ""))
         sku_code = safe_str(r.get("SKU编码", ""))
+        if not sku_code:
+            sku_code = safe_str(r.get("产品名称", "")) or safe_str(r.get("规格", ""))
         qty = to_num(r.get("合同数量", 0))
         if not contract_id or not sku_code or qty <= 0:
             continue
-        key = (contract_id, sku_code)
+        # Canonicalize SKU before creating reservation
+        if inv is not None and not inv.empty:
+            _, _, canon_sku = find_inventory_row(
+                sku_code, r.to_dict(), inv, sku_df=sku_df
+            )
+            canon_sku = canon_sku or sku_code
+        else:
+            canon_sku = sku_code
+        key = (contract_id, canon_sku)
         qty_by_contract_sku[key] = qty_by_contract_sku.get(key, 0.0) + qty
 
     rows = []
-    for (contract_id, sku_code), qty in qty_by_contract_sku.items():
+    for (contract_id, canon_sku), qty in qty_by_contract_sku.items():
         rows.append({
-            "预留ID": f"{batch_id}_{contract_id}_{sku_code}",
+            "预留ID": f"{batch_id}_{contract_id}_{canon_sku}",
             "合同编号": contract_id,
-            "SKU": sku_code,
+            "SKU": canon_sku,
             "预留数量": qty,
             "批次号": batch_id,
             "创建时间": now_str,
@@ -1498,6 +1687,14 @@ td:first-child{font-family:monospace;font-weight:600;width:100px}
 </div>
 <div class="main">
   <div class="card">
+    <h3>导入订单</h3>
+    <p>拖拽或选择 OA 导出的 Excel 文件，自动校验并导入飞书多维表格。支持订单明细表和订单主表。</p>
+    <input type="file" id="fileInput" accept=".xlsx,.xls" style="margin-bottom:8px"><br>
+    <label><input type="checkbox" id="allowEmptySku"> 允许 SKU 为空（排单时自动匹配）</label><br>
+    <button class="btn btn-primary" id="importBtn" onclick="importExcel()" style="margin-top:8px">导入到飞书</button>
+    <div class="status" id="importStatus"></div>
+  </div>
+  <div class="card">
     <h3>触发排单</h3>
     <p>点击按钮执行一次完整的 AI 排单流程：读取订单 → 匹配库存 → 计算缺货 → 产能调度 → 写回飞书。</p>
     <button class="btn btn-primary" id="runBtn" onclick="runSchedule()">执行排单</button>
@@ -1516,6 +1713,21 @@ td:first-child{font-family:monospace;font-weight:600;width:100px}
   </div>
 </div>
 <script>
+async function importExcel(){
+  const file=document.getElementById('fileInput').files[0];
+  const st=document.getElementById('importStatus');
+  if(!file){st.textContent='请先选择 Excel 文件';return;}
+  st.textContent='正在导入...';
+  const fd=new FormData();
+  fd.append('file',file);
+  fd.append('auto_fix',document.getElementById('allowEmptySku').checked);
+  try{
+    const r=await fetch('/import',{method:'POST',body:fd});
+    const d=await r.json();
+    if(d.ok){st.textContent='导入成功! '+d.results.map(x=>x.sheet+':'+x.rows+'行').join(', ');}
+    else{st.textContent='导入失败: '+d.results.map(x=>x.sheet+':'+(x.error||'OK')).join(', ');}
+  }catch(e){st.textContent='网络错误: '+e.message;}
+}
 async function runSchedule(){
   const btn=document.getElementById('runBtn');
   const res=document.getElementById('result');
@@ -1551,6 +1763,276 @@ def home():
 def api_docs():
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=HOME_HTML)
+
+
+def delete_all_records(table_id: str) -> int:
+    """删除指定飞书多维表格的全部记录，返回删除条数。"""
+    headers = _feishu_headers()
+
+    # 查所有 record_id
+    all_ids = []
+    page_token = None
+    while True:
+        url = f"{FEISHU_BITABLE_BASE}/tables/{table_id}/records/search"
+        payload: Dict[str, Any] = {"page_size": 500}
+        if page_token:
+            payload["page_token"] = page_token
+        resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        data = _safe_http_json(resp, "查询记录")
+        if data.get("code") != 0:
+            raise Exception(f"查询记录失败: code={data.get('code')}, msg={data.get('msg')}")
+        items = data.get("data", {}).get("items", [])
+        for item in items:
+            all_ids.append(item.get("record_id", ""))
+        if not data.get("data", {}).get("has_more"):
+            break
+        page_token = data.get("data", {}).get("page_token", "")
+
+    if not all_ids:
+        return 0
+
+    # 分批删除
+    delete_url = f"{FEISHU_BITABLE_BASE}/tables/{table_id}/records/batch_delete"
+    deleted = 0
+    for i in range(0, len(all_ids), 500):
+        batch = all_ids[i:i + 500]
+        resp = httpx.post(delete_url, headers=headers, json={"records": batch}, timeout=60.0)
+        data = _safe_http_json(resp, "删除记录")
+        if data.get("code") != 0:
+            raise Exception(f"删除记录失败: code={data.get('code')}, msg={data.get('msg')}")
+        deleted += len(batch)
+    return deleted
+
+
+@app.post("/import")
+async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False)):
+    """上传 Excel 文件，校验后写入飞书多维表格。
+
+    Excel 结构:
+        Sheet1（订单表）: 订单编号, 客户名称, 项目名称, 商务, 下单时间, 国网设备名称, 设备型号, 数量
+        Sheet2（库存表）: 国网设备名称, 型号, 库存数量
+    """
+    import io
+    try:
+        contents = await file.read()
+        xl = pd.ExcelFile(io.BytesIO(contents))
+    except Exception as e:
+        return {"ok": False, "error": f"无法读取 Excel 文件: {e}"}
+
+    # OA 导出列名 → 标准列名
+    OA_COLUMN_MAP = {
+        "订单编号": "合同编号",
+        "数量": "合同数量",
+        "设备型号": "规格",
+        "设备名称": "产品名称",
+        "国网设备名称": "产品名称",
+        "下单日期": "下单时间",
+        "订单时间": "下单时间",
+        "下单时间": "下单时间",
+        "申请时间": "下单时间",
+        "申请人": "商务",
+    }
+
+    # 订单主表：标准列名 → 飞书字段名
+    MAIN_FIELD_MAP = {
+        "合同编号": "合同编号",
+        "下单时间": "下单日期",      # MAIN 表字段叫「下单日期」
+        "客户名称": "客户名称",
+        "项目名称": "项目名称",
+        "商务": "商务",
+    }
+
+    # 订单明细表：标准列名 → 飞书字段名
+    ITEMS_FIELD_MAP = {
+        "合同编号": "合同编号",
+        "下单时间": "下单时间",
+        "产品名称": "产品名称",
+        "规格": "规格",
+        "合同数量": "合同数量",
+    }
+
+    # 库存表：Excel 列名 → 飞书字段名
+    INV_COLUMN_MAP = {
+        "国网设备名称": "国网设备名称",
+        "型号": "国网设备型号",
+        "库存数量": "库存数量",
+    }
+
+    results = []
+    orders_done = False
+
+    for sheet_name in xl.sheet_names:
+        try:
+            df_raw = pd.read_excel(xl, sheet_name=sheet_name)
+        except Exception as e:
+            results.append({"sheet": sheet_name, "ok": False, "error": f"读取失败: {e}"})
+            continue
+
+        print(f"[导入] Sheet={sheet_name}, 原始列={list(df_raw.columns)}")
+
+        # ---- 检测 Sheet 类型 ----
+        cols = set(df_raw.columns)
+        has_order_id = "订单编号" in cols or "合同编号" in cols
+        has_device = bool({"国网设备名称", "设备名称", "产品名称", "设备型号", "规格"} & cols)
+        is_inventory = "库存数量" in cols
+
+        # ============================================================
+        # 订单表 → 主表 + 明细表
+        # ============================================================
+        if has_order_id and (has_device or "数量" in cols or "合同数量" in cols):
+            if orders_done:
+                continue
+
+            df = df_raw.copy()
+            df = df.loc[:, ~df.columns.astype(str).str.match(r'^Unnamed')]
+            # 应用 OA 映射
+            df = df.rename(columns=lambda c: OA_COLUMN_MAP.get(c, c))
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            # 清洗字符串
+            for col in {"合同编号", "产品名称", "规格", "客户名称", "项目名称", "商务", "SKU编码"}:
+                if col in df.columns:
+                    df[col] = df[col].apply(safe_str)
+
+            # 校验
+            if "合同编号" not in df.columns:
+                results.append({"sheet": sheet_name, "ok": False, "error": "缺少「订单编号」列"})
+                continue
+
+            empty_contract = df["合同编号"] == ""
+            if empty_contract.any():
+                results.append({"sheet": sheet_name, "ok": False, "error": f"合同编号为空 {empty_contract.sum()} 行"})
+                continue
+
+            if "合同数量" in df.columns:
+                df["合同数量"] = df["合同数量"].apply(to_num)
+
+            if "下单时间" in df.columns:
+                # Excel 数字日期检测（如 46156 = 2026-05-29）
+                sample = df["下单时间"].dropna()
+                if len(sample) > 0 and pd.api.types.is_numeric_dtype(sample):
+                    excel_epoch = pd.Timestamp("1899-12-30")
+                    df["下单时间"] = df["下单时间"].apply(
+                        lambda x: excel_epoch + pd.Timedelta(days=int(x)) if pd.notna(x) and x > 0 else pd.NaT
+                    )
+                else:
+                    df["下单时间"] = pd.to_datetime(df["下单时间"], errors="coerce")
+
+            sku_empty = 0
+            if "SKU编码" in df.columns:
+                sku_empty = (df["SKU编码"] == "").sum()
+
+            # 1) 写入订单主表（去重）
+            main_avail = [c for c in ["合同编号", "下单时间", "客户名称", "项目名称", "商务"] if c in df.columns]
+            df_main = df[main_avail].drop_duplicates(subset=["合同编号"], keep="first")
+            print(f"[导入] 主表去重: {len(df_main)} 行 (原始 {len(df)} 行)")
+
+            try:
+                written = write_df_to_bitable(
+                    TABLE_ID_MAIN, df_main,
+                    fields_map=MAIN_FIELD_MAP,
+                    date_cols={"下单时间"},
+                )
+                if written <= 0:
+                    results.append({"sheet": sheet_name, "ok": False, "error": f"主表写入失败: 0 条"})
+                    continue
+                results.append({"sheet": sheet_name, "ok": True, "table": "销售订单主表", "rows": len(df_main), "warnings": []})
+            except Exception as e:
+                results.append({"sheet": sheet_name, "ok": False, "error": f"主表写入异常: {e}"})
+                continue
+
+            # 2) 写入订单明细表
+            items_avail = [c for c in ["合同编号", "下单时间", "产品名称", "规格", "合同数量"] if c in df.columns]
+            df_items = df[items_avail]
+
+            # 过滤掉产品名称包含"费"的明细（费用类不需要出库）
+            if "产品名称" in df_items.columns:
+                fee_mask = df_items["产品名称"].str.contains("费", na=False)
+                if fee_mask.sum() > 0:
+                    df_items = df_items[~fee_mask]
+                    print(f"[导入] 已过滤 {fee_mask.sum()} 行含'费'的明细（费用类无需出库）")
+
+            print(f"[导入] 明细表: {len(df_items)} 行")
+
+            try:
+                written2 = write_df_to_bitable(
+                    TABLE_ID_ITEMS, df_items,
+                    fields_map=ITEMS_FIELD_MAP,
+                    numeric_cols={"合同数量"},
+                    date_cols={"下单时间"},
+                )
+                if written2 <= 0:
+                    results.append({"sheet": sheet_name, "ok": False, "error": f"明细表写入失败: 0 条"})
+                else:
+                    warnings = []
+                    if sku_empty > 0:
+                        warnings.append(f"SKU编码为空 {sku_empty} 行（排单时会自动匹配）")
+                    results.append({"sheet": sheet_name, "ok": True, "table": "销售订单明细表", "rows": len(df_items), "warnings": warnings})
+            except Exception as e:
+                results.append({"sheet": sheet_name, "ok": False, "error": f"明细表写入异常: {e}"})
+
+            orders_done = True
+
+        # ============================================================
+        # 库存表 → 库存快照表（清除后导入）
+        # ============================================================
+        elif is_inventory:
+            df_inv = df_raw.copy()
+            df_inv = df_inv.loc[:, ~df_inv.columns.astype(str).str.match(r'^Unnamed')]
+            df_inv = df_inv.rename(columns=lambda c: INV_COLUMN_MAP.get(c, c))
+
+            # 校验
+            if "库存数量" not in df_inv.columns:
+                results.append({"sheet": sheet_name, "ok": False, "error": "缺少「库存数量」列"})
+                continue
+            if "国网设备名称" not in df_inv.columns:
+                results.append({"sheet": sheet_name, "ok": False, "error": "缺少「国网设备名称」列"})
+                continue
+            if "国网设备型号" not in df_inv.columns:
+                results.append({"sheet": sheet_name, "ok": False, "error": "缺少「型号」列"})
+                continue
+
+            df_inv["库存数量"] = df_inv["库存数量"].apply(to_num)
+            for col in ["国网设备名称", "国网设备型号"]:
+                if col in df_inv.columns:
+                    df_inv[col] = df_inv[col].apply(safe_str)
+
+            empty_name = (df_inv["国网设备名称"] == "").sum()
+            if empty_name > 0:
+                results.append({"sheet": sheet_name, "ok": False, "error": f"国网设备名称为空 {empty_name} 行"})
+                continue
+
+            inv_cols = [c for c in ["国网设备名称", "国网设备型号", "库存数量"] if c in df_inv.columns]
+            df_inv_write = df_inv[inv_cols]
+            inv_field_map = {c: c for c in inv_cols}
+
+            print(f"[导入] 库存表: {len(df_inv_write)} 行，先清除旧数据")
+
+            try:
+                deleted = delete_all_records(TABLE_ID_INV)
+                print(f"[导入] 已清除旧库存 {deleted} 条")
+            except Exception as e:
+                results.append({"sheet": sheet_name, "ok": False, "error": f"清除旧库存失败: {e}"})
+                continue
+
+            try:
+                written = write_df_to_bitable(
+                    TABLE_ID_INV, df_inv_write,
+                    fields_map=inv_field_map,
+                    numeric_cols={"库存数量"},
+                )
+                if written <= 0:
+                    results.append({"sheet": sheet_name, "ok": False, "error": "库存写入失败: 0 条"})
+                else:
+                    results.append({"sheet": sheet_name, "ok": True, "table": "库存快照表", "rows": len(df_inv_write), "warnings": []})
+            except Exception as e:
+                results.append({"sheet": sheet_name, "ok": False, "error": f"库存写入异常: {e}"})
+
+        else:
+            results.append({"sheet": sheet_name, "ok": False, "error": f"无法识别类型，列名: {list(cols)}"})
+
+    all_ok = all(r.get("ok") for r in results)
+    return {"ok": all_ok, "results": results}
 
 
 # =========================
@@ -1743,6 +2225,8 @@ def generate_daily_report(
             for _, r in shortage_items.iterrows():
                 sku = _clean_sku(_s(r.get("SKU编码", "")))
                 if not sku:
+                    sku = _s(r.get("产品名称", "")) or _s(r.get("规格", ""))
+                if not sku:
                     continue
                 gap_by_sku[sku] = gap_by_sku.get(sku, 0.0) + to_num(r.get("缺口数量", 0))
             sorted_gaps = sorted(gap_by_sku.items(), key=lambda x: x[1], reverse=True)
@@ -1791,6 +2275,17 @@ def generate_daily_report(
     f3_short = future_3[future_3["整体状态"] == "缺货"]["合同编号"].nunique()
     f7_ship = future_7.loc[future_7["合同编号"] != "", "合同编号"].nunique()
 
+    # ---- 缺货统计（产品名称+缺货数量，每行一个SKU） ----
+    shortage_stats_lines = []
+    for sku_code, gap in shortage_order_skus:
+        if not sku_code or gap <= 0:
+            continue
+        dev_name = sku_name_map.get(sku_code, sku_code)
+        unit = sku_unit_map.get(sku_code, "个")
+        gap_str = str(int(gap)) if gap == int(gap) else str(round(gap, 1))
+        shortage_stats_lines.append(f"{dev_name}（缺{gap_str}{unit}）")
+    shortage_stats = "\n".join(shortage_stats_lines)
+
     # ---- 组装结果 ----
     report = {
         "日期": today_str,
@@ -1809,7 +2304,6 @@ def generate_daily_report(
         "库存充足SKU数": str(sufficient),
         "库存预警SKU数": str(warning),
         "库存缺货SKU数": str(shortage),
-        "最紧缺SKU": _fmt_shortage_sku(shortage_order_skus[:1], sku_name_map, sku_unit_map),
         "最紧缺SKU缺口": str(int(gap_max)) if gap_max == int(gap_max) else str(round(gap_max, 1)),
         "最长交期订单": max_lead_contract,
         "最晚发货日期": latest_ship_date,
@@ -1817,6 +2311,7 @@ def generate_daily_report(
         "未来3天应发货订单数": str(f3_ship),
         "未来3天缺货订单数": str(f3_short),
         "未来7天应发货订单数": str(f7_ship),
+        "库存缺货统计": shortage_stats,
     }
     return report
 
@@ -1903,7 +2398,7 @@ def get_today_report_row() -> dict:
         "今日可发货订单数": parse_feishu_field(record.get("今日可发货订单数")) or "0",
         "今日预计延迟订单数": parse_feishu_field(record.get("今日预计延迟订单数")) or "0",
         "库存缺货SKU数":    parse_feishu_field(record.get("库存缺货SKU数")) or "0",
-        "最紧缺SKU":        parse_feishu_field(record.get("最紧缺SKU")) or "无",
+        "库存缺货统计":     parse_feishu_field(record.get("库存缺货统计")) or "无",
         "最紧缺SKU缺口":    parse_feishu_field(record.get("最紧缺SKU缺口")) or "0",
         "未来3天缺货订单数": parse_feishu_field(record.get("未来3天缺货订单数")) or "0",
         "日期":             record_date_str or today_str,
@@ -1932,7 +2427,7 @@ def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: di
         pending = int(summary[summary["订单状态"] == "待确认"].shape[0]) if summary is not None and not summary.empty else 0
         shortage_orders = int(summary[summary["整体状态"] == "缺货"].shape[0]) if summary is not None and not summary.empty else 0
 
-        shortage_sku = report.get("最紧缺SKU", "") if report else ""
+        shortage_sku = (report.get("库存缺货统计") or "").split("\n")[0] if report else ""
         ship_3d = report.get("未来3天应发货订单数", "0") if report else "0"
 
         lines = [
@@ -1945,6 +2440,40 @@ def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: di
         if shortage_sku:
             lines.append(f"**紧缺物料**：{shortage_sku}")
         lines.append(f"**未来3天应发货**：{ship_3d} 单")
+
+        # ---- 未来3天待发项目 ----
+        if summary is not None and not summary.empty and "发货日期" in summary.columns:
+            from datetime import date, timedelta
+            today_date = date.today()
+            next_3d = today_date + timedelta(days=3)
+            ship_col = summary["发货日期"].apply(
+                lambda x: x if isinstance(x, date) else (x.date() if isinstance(x, pd.Timestamp) else None)
+            )
+            upcoming = summary[
+                ship_col.notna() & (ship_col >= today_date) & (ship_col <= next_3d)
+            ].sort_values(by=["发货日期"], kind="stable")
+
+            if not upcoming.empty:
+                lines.append("")
+                lines.append("**📦 未来3天待发项目**：")
+                from collections import defaultdict
+                by_date: dict = defaultdict(list)
+                for _, r in upcoming.iterrows():
+                    sd = r["发货日期"]
+                    if isinstance(sd, pd.Timestamp):
+                        sd = sd.date()
+                    pname = safe_str(r.get("项目名称", "")) or safe_str(r.get("合同编号", ""))
+                    if sd and pname:
+                        by_date[sd].append(pname)
+
+                for sd in sorted(by_date.keys()):
+                    names = by_date[sd]
+                    date_label = f"{sd.month}月{sd.day}日"
+                    projects = "、".join(names[:5])
+                    if len(names) > 5:
+                        projects += f"等{len(names)}个"
+                    lines.append(f"• **{date_label}**：{projects}")
+
         lines.append("")
         lines.append(f"[查看排单总表](https://wl6wihmop1.feishu.cn/base/C5JzbAfnia0nT3sRvjucXgUGnDc?table=tbl09Z6C7wCGh3mW&view=vewiuVK8pH)")
 
@@ -2045,8 +2574,8 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     # 实时计算库存占用：已确认订单需求 + 有效预留
     # =========================
     confirmed_contract_ids = get_confirmed_contract_ids(old_summary)
-    locked_stock = summarize_confirmed_stock(old_summary, items)
-    active_reserved_stock = summarize_effective_reservations(reservations)
+    locked_stock = summarize_confirmed_stock(old_summary, items, inv=inv, sku_df=sku)
+    active_reserved_stock = summarize_effective_reservations(reservations, inv=inv, sku_df=sku)
     occupied_stock: Dict[str, float] = {}
     for sku_code in set(locked_stock) | set(active_reserved_stock):
         occupied_stock[sku_code] = locked_stock.get(sku_code, 0.0) + active_reserved_stock.get(sku_code, 0.0)
@@ -2066,10 +2595,21 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         pass
     stock_base_date = max(today, inv_latest_date)
 
+    # 按 下单时间 → 合同编号 排序，早下单的优先占用库存
+    if "下单时间" in items.columns:
+        items = items.sort_values(by=["下单时间", "合同编号"], kind="stable")
+    else:
+        items = items.sort_values(by=["合同编号"], kind="stable")
+
+    running_consumed: Dict[str, float] = {}
+    generated_skus_in_batch: Set[str] = set()  # 防止同批次重复生成 SKU
     backfill_rows = []
     for _, row in items.iterrows():
         row_dict = row.to_dict()
         sku_code = safe_str(row_dict.get("SKU编码", ""))
+        # 当 SKU编码 不存在时，依次尝试 产品名称、规格 作为 SKU 标识
+        if not sku_code:
+            sku_code = safe_str(row_dict.get("产品名称", "")) or safe_str(row_dict.get("规格", ""))
         contract_id = safe_str(row_dict.get("合同编号", ""))
 
         if not sku_code or not contract_id:
@@ -2078,25 +2618,74 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             print(f"[锁] 合同 {contract_id} 已确认，销售订单明细表禁止重算和回填")
             continue
 
-        inv_info, _inv_how = find_inventory_row(sku_code, row_dict, inv, sku_df=sku)
+        inv_info, _inv_how, canonical_sku = find_inventory_row(sku_code, row_dict, inv, sku_df=sku)
+        if not canonical_sku:
+            canonical_sku = sku_code
         if inv_info is None:
             print(f"⚠️ 库存未匹配 合同={contract_id} SKU={sku_code} 规格={safe_str(row_dict.get('规格', ''))[:50]} → {_inv_how}")
 
-        reserved = occupied_stock.get(sku_code, 0.0)
-        available = calc_available_stock(inv_info, reserved_qty=reserved)
+        batch_reserved = running_consumed.get(canonical_sku, 0.0)
+        total_reserved = occupied_stock.get(canonical_sku, 0.0) + batch_reserved
+        available = calc_available_stock(inv_info, reserved_qty=total_reserved)
 
         demand = to_num(row_dict.get("合同数量", 0))
         status, gap = calc_stock_status_and_gap(demand, available)
+
+        consumed = demand - gap
+        running_consumed[canonical_sku] = running_consumed.get(canonical_sku, 0.0) + consumed
 
         rb800_flag = "是" if is_rb800_from_text(pick_model_text(row_dict)) else "否"
 
         eta_date = ""
         if status == "缺货":
-            eta = calc_shortage_eta_date(sku_code=sku_code, sku_df=sku, base_date=stock_base_date)
+            in_inv = inv_info is not None
+            eta = calc_shortage_eta_date(sku_code=canonical_sku, sku_df=sku, base_date=stock_base_date, in_inventory=in_inv)
             eta_date = eta.strftime("%Y-%m-%d")
+
+        # === SKU 自动补全：将 canonical SKU 写回订单明细表 ===
+        # 仅精确索引匹配（路径1）才写回 SKU，倒排索引匹配可能不准确
+        is_exact_match = _inv_how.startswith("SKU列匹配") if inv_info is not None else False
+        original_sku = safe_str(row_dict.get("SKU编码", ""))
+        product_name = safe_str(row_dict.get("产品名称", ""))
+        spec = safe_str(row_dict.get("规格", ""))
+
+        if inv_info is not None and is_exact_match:
+            # 场景 A: 精确匹配 → 补全 SKU 标准表 + 写回规范 SKU
+            ensure_sku_in_standard_table(canonical_sku, product_name or spec, is_new=False, sku_df=sku)
+            if not original_sku or original_sku != canonical_sku:
+                print(f"[SKU补全] 合同={contract_id} {original_sku or '(空)'} → {canonical_sku}")
+        elif inv_info is not None and not is_exact_match:
+            # 倒排索引匹配 → 仅内部追踪，不写回（避免误匹配）
+            if not original_sku:
+                print(f"[SKU跳过] 合同={contract_id} '{product_name}' 倒排匹配→{canonical_sku}（不写回，等待人工确认SKU编码）")
+        elif inv_info is None and not original_sku:
+            # 场景 B: 全新产品 → 自动生成 SKU（防止同批次重复）
+            new_sku = generate_sku_for_product(product_name, spec, sku_df=sku)
+            if new_sku:
+                if new_sku in generated_skus_in_batch:
+                    print(f"[SKU跳过] 合同={contract_id} '{product_name}' → {new_sku} (本批次已存在)")
+                else:
+                    print(f"[SKU自动生成] 合同={contract_id} 新产品 '{product_name}' → {new_sku}")
+                    ensure_sku_in_standard_table(new_sku, product_name, is_new=True, sku_df=sku)
+                    generated_skus_in_batch.add(new_sku)
+                canonical_sku = new_sku
+                # 重新计算 ETA：新产品 15 天
+                if status == "缺货":
+                    eta = calc_shortage_eta_date(sku_code=canonical_sku, sku_df=sku, base_date=stock_base_date, in_inventory=False)
+                    eta_date = eta.strftime("%Y-%m-%d")
+            else:
+                print(f"[SKU生成跳过] 合同={contract_id} 无法分类产品 '{product_name}'，保持使用产品名")
+
+        # 确定是否需要写回 SKU 编码到订单明细表
+        sku_to_write = None
+        if is_exact_match and (not original_sku or original_sku != canonical_sku):
+            sku_to_write = canonical_sku  # 精确匹配：写回规范 SKU
+        elif inv_info is None and canonical_sku != sku_code:
+            sku_to_write = canonical_sku  # 新产品自动生成：写回新 SKU
 
         backfill_rows.append({
             "_record_id": safe_str(row_dict.get("_record_id", "")),
+            "SKU编码": sku_to_write,
             "库存可用量": available,
             "缺口数量": gap,
             "库存状态": status,
@@ -2104,6 +2693,10 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             "是否RB800": rb800_flag,
             "排单批次号": batch_id,
         })
+
+    if running_consumed:
+        top_skus = sorted(running_consumed.items(), key=lambda x: x[1], reverse=True)[:10]
+        print(f"[逐次扣减] 本批次共消耗 {len(running_consumed)} 个SKU，Top10: {top_skus}")
 
     df_backfill = pd.DataFrame(backfill_rows)
     if df_backfill.empty:
@@ -2131,6 +2724,15 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             df_detail[required_col] = ""
     df_detail["合同编号"] = df_detail["合同编号"].astype(str).apply(safe_str)
     df_detail["SKU编码"] = df_detail["SKU编码"].astype(str).apply(safe_str)
+    # 当 SKU编码 为空时，依次使用 产品名称、规格 作为 SKU 标识
+    empty_sku_mask = df_detail["SKU编码"] == ""
+    if empty_sku_mask.any():
+        if "产品名称" in df_detail.columns:
+            df_detail.loc[empty_sku_mask, "SKU编码"] = df_detail.loc[empty_sku_mask, "产品名称"].astype(str).apply(safe_str)
+        # 产品名称 也为空的，再用 规格 兜底
+        still_empty = df_detail["SKU编码"] == ""
+        if still_empty.any() and "规格" in df_detail.columns:
+            df_detail.loc[still_empty, "SKU编码"] = df_detail.loc[still_empty, "规格"].astype(str).apply(safe_str)
     df_detail = df_detail[(df_detail["合同编号"] != "") & (df_detail["SKU编码"] != "")]
     df_detail["合同数量"] = df_detail["合同数量"].apply(to_num)
     df_detail["库存可用量"] = df_detail["库存可用量"].apply(to_num)
@@ -2239,20 +2841,52 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 project_type = "常规项目"
 
             sku_codes = group["SKU编码"].astype(str).apply(safe_str)
-            sku_count = safe_val(sku_codes.nunique())
+            sku_codes = sku_codes[sku_codes != ""]  # 排除空 SKU（无编码用产品名兜底）
+            sku_count = safe_val(sku_codes.nunique()) if len(sku_codes) > 0 else 0
             total_qty = safe_val(group["合同数量"].sum())
             shortage_mask = group["库存状态"] == "缺货"
             shortage_rows = group[shortage_mask]
-            shortage_sku_codes = sorted(normalize_shortage_sku_list(shortage_rows['SKU编码'].dropna().unique().tolist()))
+            # Canonicalize shortage identifiers: use SKU code, fall back to product name
+            raw_shortage_identifiers = []
+            for _, r in shortage_rows.iterrows():
+                sku_val = safe_str(r.get("SKU编码", ""))
+                if sku_val and sku_val.lower() != "nan":
+                    raw_shortage_identifiers.append(sku_val)
+                else:
+                    pname = safe_str(r.get("产品名称", ""))
+                    if pname:
+                        raw_shortage_identifiers.append(pname)
+
+            canon_shortage: Dict[str, str] = {}
+            for raw_code in sorted(set(raw_shortage_identifiers)):
+                raw_str = safe_str(raw_code)
+                if not raw_str:
+                    continue
+                _, _, canon = find_inventory_row(raw_str, {"产品名称": raw_str, "规格": raw_str}, inv, sku_df=sku)
+                canon_key = canon or raw_str
+                if canon_key not in canon_shortage:
+                    canon_shortage[canon_key] = raw_str
+            shortage_sku_codes = sorted(canon_shortage.keys())
             shortage_sku_names = []
             for sku_code in shortage_sku_codes:
                 dev_name = sku_device_name_map.get(sku_code, "")
                 if dev_name:
                     shortage_sku_names.append(dev_name)
                 else:
-                    shortage_sku_names.append(sku_code)
+                    # 尝试从原始标识获取显示名（SKU为空时直接用产品名）
+                    shortage_sku_names.append(canon_shortage.get(sku_code, sku_code))
             shortage_sku_count = len(shortage_sku_codes)
             overall_status = "缺货" if shortage_sku_count else "有货"
+
+            # 保护人工确认字段：如果旧记录已人工确认，保留原值
+            old_confirmed = "否"
+            old_manual_date = ""
+            if not old_summary.empty:
+                old_row = old_summary[old_summary["合同编号"] == contract_id]
+                if not old_row.empty:
+                    if safe_str(old_row.iloc[0].get("是否人工确认", "")) == "是":
+                        old_confirmed = "是"
+                        old_manual_date = safe_str(old_row.iloc[0].get("人工确认发货时间", ""))
 
             summary_rows.append({
                 "合同编号": contract_id,
@@ -2269,11 +2903,28 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 "AI建议": "",
                 "排单批次号": batch_id,
                 "订单状态": "待确认",
-                "是否人工确认": "否",
-                "人工确认发货时间": ""
+                "是否人工确认": old_confirmed,
+                "人工确认发货时间": old_manual_date,
             })
 
     summary = pd.DataFrame(summary_rows)
+
+    # ---- 合并 old_summary 中已确认/已发货的合同（它们不在 df_detail 中，需要保留） ----
+    if not old_summary.empty and "合同编号" in old_summary.columns and "订单状态" in old_summary.columns:
+        old_confirmed = old_summary[
+            old_summary["订单状态"].apply(lambda x: normalize_order_status(x)) != "待确认"
+        ]
+        if not old_confirmed.empty:
+            existing_ids = set(summary["合同编号"].astype(str).apply(safe_str)) if not summary.empty else set()
+            for _, old_row in old_confirmed.iterrows():
+                cid = safe_str(old_row.get("合同编号", ""))
+                if cid and cid not in existing_ids:
+                    summary = pd.concat([summary, pd.DataFrame([old_row.to_dict()])], ignore_index=True)
+                    existing_ids.add(cid)
+            carried_over = len(existing_ids) - (len(summary_rows) if not summary.empty else 0)
+            if carried_over > 0:
+                print(f"[保留] 已确认/已发货合同 {carried_over} 条已从历史记录补回")
+
     if not summary.empty:
         summary["合同编号"] = summary["合同编号"].astype(str).apply(safe_str)
         summary = summary.drop_duplicates(subset=["合同编号"], keep="last")
@@ -2385,7 +3036,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             "合同编号",
         ].astype(str).apply(safe_str).tolist()
     released_count = release_old_contract_reservations(reservations, pending_contracts)
-    reservation_rows = build_reservation_rows(summary, df_detail, batch_id)
+    reservation_rows = build_reservation_rows(summary, df_detail, batch_id, inv=inv, sku_df=sku)
     if not reservation_rows.empty:
         write_df_to_bitable(
             TABLE_ID_RESERVATION,
@@ -2417,13 +3068,21 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     shipping_written = 0
     if TABLE_ID_SHIPPING and not summary.empty:
         print("正在写入 AI发货总表...")
-        # 读取已存在的发货记录，保护已发货合同不被覆盖
-        existing_shipped_ids: Set[str] = set()
+        # 读取已存在的发货记录，保护人工修改的字段不被覆盖
+        existing_shipping_map: Dict[str, Dict[str, str]] = {}
         try:
             existing_shipping = fetch_bitable_to_df(TABLE_ID_SHIPPING)
-            if not existing_shipping.empty and "是否发货" in existing_shipping.columns and "合同编号" in existing_shipping.columns:
-                shipped_mask = existing_shipping["是否发货"].astype(str) == "是"
-                existing_shipped_ids = set(existing_shipping.loc[shipped_mask, "合同编号"].astype(str).apply(safe_str))
+            if not existing_shipping.empty and "合同编号" in existing_shipping.columns:
+                for _, er in existing_shipping.iterrows():
+                    cid = safe_str(er.get("合同编号", ""))
+                    if cid:
+                        existing_shipping_map[cid] = {
+                            "是否发货": safe_str(er.get("是否发货", "否")),
+                            "发货日期": safe_str(er.get("发货日期", "")),
+                            "快递公司": safe_str(er.get("快递公司", "")),
+                            "快递单号": safe_str(er.get("快递单号", "")),
+                            "备注": safe_str(er.get("备注", "")),
+                        }
         except Exception as e:
             print(f"读取 AI发货总表现有记录失败: {e}")
         shipping_rows = []
@@ -2431,15 +3090,16 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
             c_id = safe_str(row.get("合同编号", ""))
             if not c_id:
                 continue
+            existing = existing_shipping_map.get(c_id, {})
             shipping_rows.append({
                 "合同编号": c_id,
                 "客户名称": contract_info_map.get(c_id, {}).get("客户名称", ""),
                 "项目名称": contract_info_map.get(c_id, {}).get("项目名称", ""),
-                "是否发货": "是" if c_id in existing_shipped_ids else "否",
-                "发货日期": "",
-                "快递公司": "",
-                "快递单号": "",
-                "备注": "",
+                "是否发货": existing.get("是否发货") or "否",
+                "发货日期": existing.get("发货日期") or "",
+                "快递公司": existing.get("快递公司") or "",
+                "快递单号": existing.get("快递单号") or "",
+                "备注": existing.get("备注") or "",
             })
         df_shipping = pd.DataFrame(shipping_rows)
         if not df_shipping.empty:
@@ -2596,15 +3256,21 @@ def _get_bot_reply_token(app_id: str = "") -> str:
     return token
 
 
-def _send_bot_reply(open_id: str, card: dict, app_id: str = ""):
-    """以指定飞书应用的身份发送互动卡片回复。"""
+def _send_bot_reply(open_id: str, card: dict, app_id: str = "", chat_id: str = "", chat_type: str = ""):
+    """以指定飞书应用的身份发送互动卡片回复，群聊自动切换为 chat_id 回复。"""
     token = _get_bot_reply_token(app_id)
     name = _BOT_CREDENTIALS.get(app_id, {}).get("name", app_id)
+    if chat_type == "group" and chat_id:
+        receive_id_type = "chat_id"
+        receive_id = chat_id
+    else:
+        receive_id_type = "open_id"
+        receive_id = open_id
     resp = httpx.post(
-        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+        f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={
-            "receive_id": open_id,
+            "receive_id": receive_id,
             "msg_type": "interactive",
             "content": json.dumps(card, ensure_ascii=False),
         },
@@ -2677,13 +3343,138 @@ _seen_webhook_message_ids: set = set()
 # ==============================
 # 供应链AI助手 — 消息处理
 # ==============================
+# ===== 飞书文档扫描与 AI 加工（供供应链机器人使用） =====
+
+def _scan_and_analyze_doc(doc_url: str, question: str) -> dict:
+    """读取飞书文档内容，用 DeepSeek 加工后返回卡片。"""
+    import subprocess as _sp
+
+    # 从 URL 提取 token
+    corpus = doc_url.split("?")[0].rstrip("/")
+    parts = corpus.split("/")
+    token = parts[-1] if len(parts) >= 2 else ""
+    if not token or not re.fullmatch(r"[A-Za-z0-9_\-]+", token):
+        return _error_card(f"无法解析文档链接: {doc_url}")
+
+    # 用 lark-cli 读取文档文本
+    lark_cli_path = ""
+    candidates = [os.path.expandvars(r"%APPDATA%\npm\lark-cli.cmd")]
+    if sys.platform != "win32":
+        candidates += ["/usr/local/bin/lark-cli", "/opt/homebrew/bin/lark-cli"]
+    for p in candidates:
+        if os.path.isfile(p):
+            lark_cli_path = p
+            break
+    if not lark_cli_path:
+        for p in os.environ.get("PATH", "").split(os.pathsep):
+            for name in ("lark-cli.cmd", "lark-cli"):
+                full = os.path.join(p, name)
+                if os.path.isfile(full):
+                    lark_cli_path = full
+                    break
+            if lark_cli_path:
+                break
+    if not lark_cli_path:
+        lark_cli_path = "lark-cli"
+
+    content = ""
+    try:
+        result = _sp.run(
+            [lark_cli_path, "--profile", "main-app", "docs", "+fetch", "--token", token, "--format", "text"],
+            capture_output=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        if result.returncode != 0:
+            err = result.stderr.strip() or result.stdout.strip()
+            return _error_card(f"读取飞书文档失败: {err[:300]}")
+        content = result.stdout.strip()
+    except _sp.TimeoutExpired:
+        return _error_card("读取飞书文档超时，请稍后重试")
+    except Exception as e:
+        return _error_card(f"读取文档异常: {e}")
+
+    if not content or len(content) < 10:
+        return _error_card("文档内容为空或太短，无法分析")
+
+    # AI 加工
+    api_key = os.getenv("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        return {
+            "header": {"template": "blue", "title": {"content": "📄 文档内容", "tag": "plain_text"}},
+            "elements": [{"tag": "markdown", "content": f"（DeepSeek API Key 未配置，无法智能加工）\n\n文档原文（前 1000 字符）：\n\n{content[:1000]}..."}],
+        }
+
+    truncated = content[:12000]
+    if len(content) > 12000:
+        truncated += "\n\n（文档较长，以上为节选）"
+
+    try:
+        import httpx as _httpx
+        client = _httpx.Client(timeout=60.0)
+        resp = client.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": (
+                    f"你是供应链文档分析助手。根据以下飞书文档内容，回答用户的问题。\n\n"
+                    f"用户问题：{question}\n\n"
+                    f"文档内容：\n{truncated}\n\n"
+                    "要求：\n"
+                    "1. 回答控制在 200-400 字\n"
+                    "2. 如果文档内容与问题不相关，如实告知\n"
+                    "3. 关键数字和数据要原样引用，不要编造\n"
+                    "4. 用 Markdown 格式输出，适当使用粗体和列表"
+                )}],
+                "temperature": 0.3,
+                "max_tokens": 2048,
+            },
+        )
+        ai_data = resp.json()
+        if "choices" in ai_data and len(ai_data["choices"]) > 0:
+            result_text = ai_data["choices"][0]["message"]["content"].strip()
+        else:
+            result_text = f"（AI 加工失败）\n\n文档原文摘要：{truncated[:500]}..."
+    except Exception as e:
+        result_text = f"（AI 加工失败: {e}）\n\n文档原文摘要：{truncated[:500]}..."
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "blue", "title": {"content": "📄 文档智能分析", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": result_text}],
+    }
+
+
 def _build_supply_chain_reply(open_id: str, user_input: str) -> dict:
     """处理供应链AI助手的消息，返回飞书互动卡片。
 
     面向企业内部员工，提供排单、库存、交期等供应链管理功能。
+    同时支持飞书文档链接的扫描与 AI 加工。
     """
     import re
     text = user_input.strip()
+
+    # ---- 飞书文档扫描（优先检测） ----
+    doc_match = re.search(
+        r"https?://[^\s/]+\.(feishu|lark)\.(cn|com)/(docx|wiki|minutes)/([A-Za-z0-9_\-]+)",
+        text, re.IGNORECASE,
+    )
+    if doc_match:
+        doc_url = doc_match.group(0)
+        question = re.sub(
+            r"https?://[^\s/]+\.(feishu|lark)\.(cn|com)/(docx|wiki|minutes)/([A-Za-z0-9_\-]+)",
+            "", text, flags=re.IGNORECASE,
+        ).strip()
+        if not question or len(question) < 2:
+            question = "请总结这份文档的核心内容和关键数据"
+        try:
+            return _scan_and_analyze_doc(doc_url, question)
+        except Exception as e:
+            return _error_card(f"文档扫描失败: {e}")
 
     # ---- 闲聊检测 ----
     chitchat_patterns = [
@@ -2695,29 +3486,48 @@ def _build_supply_chain_reply(open_id: str, user_input: str) -> dict:
             return {
                 "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
                 "elements": [{"tag": "markdown", "content": (
-                    "我是供应链AI助手，帮你掌握订单排单和交付全貌。\n\n"
+                    "您好，我是供应链AI助手，为您提供排单、库存与交付管理服务。\n\n"
                     "📊 **常用指令**\n"
-                    "• 发送 **日报** — 查看今日排单日报\n"
-                    "• 发送 **库存** — 查看库存与缺货情况\n"
-                    "• 发送 **待确认** — 查看待人工确认的订单\n"
-                    "• 发送 **合同编号** — 查询具体订单交期\n"
-                    "• 发送 **延迟** — 查看延迟订单\n\n"
-                    "直接输入关键词即可查询 👇"
+                    "• **日报** — 今日排单统计与交付概览\n"
+                    "• **库存** — 库存状态与缺货物料明细\n"
+                    "• **待确认** — 待人工确认的订单列表\n"
+                    "• **延迟** — 预计延迟或缺货的订单\n"
+                    "• **合同编号** — 查询具体订单交付详情\n"
+                    "• 📄 **飞书文档链接** — 智能分析文档内容\n\n"
+                    "直接输入关键词即可查询。"
                 )}],
             }
 
     text_lower = text.lower()
 
-    # ---- 日报 ----
-    if any(kw in text_lower for kw in ["日报", "今日排单", "排单日报", "今日", "报告"]):
+    # ============================================================
+    # 自然语言关键词匹配（按优先级从高到低）
+    # ============================================================
+
+    # ---- 日报 / 今日概况 ----
+    if any(kw in text_lower for kw in ["日报", "今日排单", "排单日报", "今日", "报告",
+                                         "今天.*排", "今天.*发", "今天.*订单", "今天.*单"]):
         try:
             report = get_today_report_row()
             return _build_report_card(report)
         except Exception as e:
             return _error_card(f"读取日报失败: {e}")
 
+    # ---- 未排单 / 排单进度 ----
+    if any(kw in text_lower for kw in ["没排", "还没排", "没有排", "未排", "还没排单",
+                                         "还剩多少", "还有多少", "剩多少没",
+                                         "排了多少", "排完了吗", "排完没",
+                                         "排单进度", "排了多少单", "哪些没排"]):
+        try:
+            report = get_today_report_row()
+            return _build_scheduling_progress_card(report)
+        except Exception as e:
+            return _error_card(f"读取排单进度失败: {e}")
+
     # ---- 库存 ----
-    if any(kw in text_lower for kw in ["库存", "缺货", "物料", "紧缺"]):
+    if any(kw in text_lower for kw in ["库存", "缺货", "物料", "紧缺",
+                                         "还有多少货", "库存情况", "库存在哪里",
+                                         "什么缺", "缺什么", "缺哪些"]):
         try:
             load_data_if_needed()
             return _build_inventory_card()
@@ -2725,15 +3535,29 @@ def _build_supply_chain_reply(open_id: str, user_input: str) -> dict:
             return _error_card(f"读取库存失败: {e}")
 
     # ---- 待确认 ----
-    if any(kw in text_lower for kw in ["待确认", "待处理", "未确认"]):
+    if any(kw in text_lower for kw in ["待确认", "待处理", "未确认", "还没确认",
+                                         "要确认", "需要确认", "哪些要确认",
+                                         "还没批", "要审批", "没确认"]):
         try:
             load_data_if_needed()
             return _build_pending_orders_card()
         except Exception as e:
             return _error_card(f"查询待确认订单失败: {e}")
 
-    # ---- 延迟 ----
-    if any(kw in text for kw in ["延迟", "延期", "推迟"]):
+    # ---- 发货情况 ----
+    if any(kw in text_lower for kw in ["发货", "发了没", "发了多少", "今天发",
+                                         "发出", "已发", "发了几", "发了哪",
+                                         "发货情况", "发货状态", "物流情况"]):
+        try:
+            report = get_today_report_row()
+            return _build_delivery_status_card(report)
+        except Exception as e:
+            return _error_card(f"查询发货状态失败: {e}")
+
+    # ---- 延迟 / 缺货订单 ----
+    if any(kw in text for kw in ["延迟", "延期", "推迟", "超期",
+                                   "延迟.*单", "哪些.*延迟", "哪些.*缺货",
+                                   "缺货.*订单", "还缺什么", "还缺哪些"]):
         try:
             load_data_if_needed()
             return _build_delayed_orders_card()
@@ -2741,20 +3565,34 @@ def _build_supply_chain_reply(open_id: str, user_input: str) -> dict:
             return _error_card(f"查询延迟订单失败: {e}")
 
     # ---- 帮助 ----
-    if any(kw in text_lower for kw in ["帮助", "help", "功能", "菜单", "说明"]):
+    if any(kw in text_lower for kw in ["帮助", "help", "功能", "菜单", "说明",
+                                         "怎么用", "能做什么", "会什么", "有什么功能"]):
         return {
             "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
             "elements": [{"tag": "markdown", "content": (
-                "**📊 供应链AI助手功能菜单**\n\n"
-                "🔹 **日报** — 今日排单日报（订单数/发货/缺货/交期）\n"
-                "🔹 **库存** — 库存状态（充足/预警/缺货SKU/紧缺物料）\n"
-                "🔹 **待确认** — 需要人工确认的排单列表\n"
-                "🔹 **延迟** — 预计延迟的订单明细\n"
-                "🔹 **合同编号** — 输入合同编号查具体订单交期\n"
-                "🔹 **触发排单** — 手动触发一次AI排单（需权限）\n\n"
-                "👇 直接输入关键词即可"
+                "您好，我是供应链AI助手，为您提供排单、库存与交付管理服务。\n\n"
+                "📊 **常用查询**\n"
+                "🔹 **日报** / **今日概况** — 今日排单统计与交付概览\n"
+                "🔹 **库存** / **缺货物料** — 库存健康度与紧缺明细\n"
+                "🔹 **待确认** / **还没确认** — 待人工确认的订单\n"
+                "🔹 **延迟** / **超期** — 预计延迟或缺货的订单\n"
+                "🔹 **发货情况** — 今日已发/应发/延迟情况\n"
+                "🔹 **排单进度** / **还有多少没排** — 排单完成情况\n\n"
+                "🔍 **快速查询**\n"
+                "🔹 输入**合同编号**查订单详情与交期\n"
+                "🔹 发送**飞书文档链接**进行智能分析\n\n"
+                "👇 直接输入自然语言即可，无需记忆指令。"
             )}],
         }
+
+    # ---- 统计 / 数据 / 汇总 ----
+    if any(kw in text_lower for kw in ["统计", "数据", "汇总", "概览", "总览",
+                                         "整体情况", "全部情况", "所有订单"]):
+        try:
+            report = get_today_report_row()
+            return _build_report_card(report)
+        except Exception as e:
+            return _error_card(f"读取日报失败: {e}")
 
     # ---- 合同编号查询 ----
     contract_match = re.search(r"([A-Za-z0-9\-_]{6,})", text)
@@ -2776,29 +3614,234 @@ def load_data_if_needed():
         load_data()
 
 
-def _build_report_card(report: dict) -> dict:
-    """日报卡片。"""
-    items = [
-        f"📊 **今日排单日报** ({report.get('日期', '-')})",
+# ===== 快捷卡片：排单进度 =====
+
+def _build_scheduling_progress_card(report: dict) -> dict:
+    """排单进度卡片 — 聚焦已完成/未完成比例。"""
+    total = report.get('订单总数', '0')
+    scheduled = report.get('已排单订单数', '0')
+    unscheduled = report.get('未排单订单数', '0')
+    confirmed = report.get('人工已确认排单数', '0')
+
+    try:
+        total_i = int(total)
+        scheduled_i = int(scheduled)
+        unscheduled_i = int(unscheduled)
+        rate = f"{int(scheduled_i / total_i * 100)}%" if total_i > 0 else "N/A"
+    except (ValueError, ZeroDivisionError):
+        total_i = scheduled_i = unscheduled_i = 0
+        rate = "N/A"
+
+    if unscheduled_i > 0:
+        status_line = f"⚠️ 还有 **{unscheduled}** 份订单尚未排单，建议尽快处理"
+        header_color = "orange"
+    else:
+        status_line = "✅ 所有订单已完成排单"
+        header_color = "green"
+
+    lines = [
+        f"📊 **排单进度** ({report.get('日期', '-')})",
         "",
-        f"订单总数：**{report.get('订单总数', '-')}** 单　|　今日新增：**{report.get('今日新增订单', '-')}** 单",
-        f"已排单：**{report.get('已排单订单数', '-')}** 单　|　人工已确认：**{report.get('人工已确认排单数', '-')}** 单",
-        f"未排单：**{report.get('未排单订单数', '-')}** 单",
+        f"订单总数：**{total}**　|　已排单：**{scheduled}**　|　完成率：**{rate}**",
+        f"未排单：**{unscheduled}**　|　人工已确认：**{confirmed}**",
         "",
-        f"🚚 今日应发：**{report.get('今日应发货订单数', '-')}** 单　|　可发：**{report.get('今日可发货订单数', '-')}** 单",
-        f"⚠️ 预计延迟：**{report.get('今日预计延迟订单数', '-')}** 单",
-        "",
-        f"📦 库存充足SKU：**{report.get('库存充足SKU数', '-')}**　|　预警：**{report.get('库存预警SKU数', '-')}**　|　缺货：**{report.get('库存缺货SKU数', '-')}**",
+        status_line,
     ]
+    if unscheduled_i > 0:
+        lines.append("")
+        lines.append("💡 回复「**待确认**」查看待处理订单列表")
 
-    shortage = report.get('最紧缺SKU', '')
-    if shortage and shortage != '无':
-        items.append(f"🔴 最紧缺：**{shortage}**（缺口 {report.get('最紧缺SKU缺口', '-')}）")
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": header_color, "title": {"content": "📊 排单进度", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+    }
 
+
+# ===== 快捷卡片：发货状态 =====
+
+def _build_delivery_status_card(report: dict) -> dict:
+    """发货状态卡片 — 区分 AI 判定可发 vs 人工确认可发（只有人工确认过的才算真正可发）。"""
+    should_ship = report.get('今日应发货订单数', '0')
+    can_ship = report.get('今日可发货订单数', '0')
+    delayed = report.get('今日预计延迟订单数', '0')
+
+    try:
+        delayed_i = int(delayed)
+        can_i = int(can_ship)
+        should_i = int(should_ship)
+    except ValueError:
+        delayed_i = can_i = should_i = 0
+
+    # 查询今日应发订单中已人工确认的数量（真正可发）
+    today_str = report.get('日期', '')
+    manual_confirmed_today = 0
+    manual_pending_today = 0
+    try:
+        detail = fetch_bitable_to_df(TABLE_ID_DETAIL)
+        if detail is not None and not detail.empty:
+            # 找出今日应发的订单
+            if "AI建议发货时间" in detail.columns and "是否人工确认" in detail.columns:
+                detail["_ship_date"] = detail["AI建议发货时间"].apply(
+                    lambda x: date_to_yyyy_mm_dd(parse_date_to_date(x))
+                )
+                today_orders = detail[detail["_ship_date"] == today_str]
+                if not today_orders.empty:
+                    confirmed_mask = today_orders["是否人工确认"].astype(str).apply(safe_str) == "是"
+                    manual_confirmed_today = int(confirmed_mask.sum())
+                    # 有货 + 已确认 = 真正可发，缺货 + 已确认 = 物料待协调
+                    available_mask = today_orders["整体状态"].astype(str).apply(safe_str) != "缺货"
+                    manual_available = int((confirmed_mask & available_mask).sum())
+                    manual_pending_today = int(len(today_orders) - manual_confirmed_today)
+                else:
+                    manual_available = 0
+    except Exception:
+        manual_confirmed_today = 0
+        manual_available = 0
+        manual_pending_today = 0
+
+    # 计算各维度
+    if should_i > 0:
+        ai_rate = f"{int(can_i / should_i * 100)}%" if should_i > 0 else "N/A"
+        manual_rate = f"{int(manual_confirmed_today / should_i * 100)}%" if should_i > 0 else "N/A"
+        manual_avail_rate = f"{int(manual_available / should_i * 100)}%" if should_i > 0 and manual_confirmed_today > 0 else "N/A"
+    else:
+        ai_rate = "N/A"
+        manual_rate = "N/A"
+        manual_avail_rate = "N/A"
+
+    # 状态判定（以人工确认为准）
+    if manual_pending_today > 0:
+        if manual_confirmed_today == 0:
+            risk_line = f"🔴 **{manual_pending_today}** 份待人工确认 —— 请尽快确认以安排发货"
+            header_color = "red"
+        else:
+            risk_line = f"🟠 {manual_confirmed_today} 份已确认可发，**{manual_pending_today}** 份待确认"
+            header_color = "orange"
+        action_hint = "\n💡 回复「**待确认**」进入人工确认页面"
+    elif delayed_i > 0:
+        risk_line = f"⚠️ **{delayed}** 份预计延迟，均已完成人工确认"
+        header_color = "orange"
+        action_hint = "\n💡 回复「**延迟**」查看延迟订单明细"
+    elif should_i == 0:
+        risk_line = "📅 今日无应发订单"
+        header_color = "blue"
+        action_hint = ""
+    else:
+        risk_line = f"✅ 今日全部已确认可发，交付率 {manual_rate}"
+        header_color = "green"
+        action_hint = ""
+
+    lines = [
+        f"🚚 **今日发货状态** ({report.get('日期', '-')})",
+        "",
+        "━━━ **应发 vs 可发** ━━━",
+        f"今日应发：**{should_ship}** 份",
+    ]
+    if should_i > 0:
+        lines.append(f"AI 判定可发：**{can_ship}** 份（{ai_rate}）— 基于库存状态")
+        lines.append(f"人工确认可发：**{manual_confirmed_today}** 份（{manual_rate}）— ✅ 真正可发")
+        if manual_available != manual_confirmed_today and manual_confirmed_today > 0:
+            lines.append(f"　其中物料充足：**{manual_available}** 份")
+    lines.append("")
+    lines.append(f"预计延迟：**{delayed}** 份")
+    lines.append(f"待人工确认：**{manual_pending_today}** 份")
+    lines.append("")
+    lines.append(risk_line)
+    if action_hint:
+        lines.append(action_hint)
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": header_color, "title": {"content": "🚚 发货状态", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+    }
+
+
+def _build_report_card(report: dict) -> dict:
+    """日报卡片 — 结构化分区，带情景化注释。"""
+    items = []
+    # --- 头部 ---
+    items.append(f"📊 **AI排单日报**")
+    items.append(f"📅 {report.get('日期', '-')}　|　批次：{report.get('排单批次号', '-')}")
     items.append("")
-    items.append(f"最长交期：**{report.get('最长交期订单', '-')}**　|　最晚发货：**{report.get('最晚发货日期', '-')}**")
-    items.append(f"未来3天应发：**{report.get('未来3天应发货订单数', '-')}** 单　|　缺货风险：**{report.get('未来3天缺货订单数', '-')}** 单")
-    items.append(f"批次号：{report.get('排单批次号', '-')}")
+
+    # --- 第一部分：订单处理概览 ---
+    items.append("━━━ **订单处理概览** ━━━")
+    items.append(
+        f"总订单：**{report.get('订单总数', '-')}**　|　"
+        f"今日新增：**{report.get('今日新增订单', '-')}**　|　"
+        f"紧急：**{report.get('今日紧急订单', '-')}**"
+    )
+    items.append(
+        f"已排单：**{report.get('已排单订单数', '-')}**　|　"
+        f"未排单：**{report.get('未排单订单数', '-')}**　|　"
+        f"人工已确认：**{report.get('人工已确认排单数', '-')}**"
+    )
+    items.append("")
+
+    # --- 第二部分：今日交付动态 ---
+    items.append("━━━ **今日交付动态** ━━━")
+    should_ship = report.get('今日应发货订单数', '0')
+    can_ship = report.get('今日可发货订单数', '0')
+    items.append(
+        f"🚚 应发货：**{should_ship}**　|　"
+        f"AI 判定可发：**{can_ship}**（基于库存）"
+    )
+    items.append(
+        f"✅ 真正可发：以**人工确认**为准 → 详情回复「**发货**」"
+    )
+    delayed = report.get('今日预计延迟订单数', '0')
+    try:
+        delayed_int = int(delayed)
+    except (ValueError, TypeError):
+        delayed_int = 0
+    if delayed_int > 0:
+        items.append(f"⚠️ 预计延迟：**{delayed}** — **建议优先关注**")
+    else:
+        items.append(f"⚠️ 预计延迟：**{delayed}** — 交付正常")
+    items.append("")
+
+    # --- 第三部分：库存风险监控 ---
+    items.append("━━━ **库存风险监控** ━━━")
+    shortage_stats = report.get('库存缺货统计', '')
+    top_shortage = (shortage_stats or '').split('\n')[0] if shortage_stats and shortage_stats != '无' else ''
+    if top_shortage:
+        items.append(
+            f"充足：**{report.get('库存充足SKU数', '-')}**　|　"
+            f"预警：**{report.get('库存预警SKU数', '-')}**　|　"
+            f"缺货：**{report.get('库存缺货SKU数', '-')}**"
+        )
+        items.append(f"🔴 **最紧缺物料**：{top_shortage} —— ⚡ 建议优先补货")
+    else:
+        items.append(
+            f"🟢 充足：**{report.get('库存充足SKU数', '-')}**　|　"
+            f"预警：**{report.get('库存预警SKU数', '-')}**　|　"
+            f"缺货：**{report.get('库存缺货SKU数', '-')}**"
+        )
+    items.append("")
+
+    # --- 第四部分：未来3天预警 ---
+    items.append("━━━ **未来3天预警** ━━━")
+    items.append(
+        f"最长交期：**{report.get('最长交期订单', '-')}**　|　"
+        f"最晚发货：**{report.get('最晚发货日期', '-')}**"
+    )
+    f3_short = report.get('未来3天缺货订单数', '0')
+    try:
+        f3_short_int = int(f3_short)
+    except (ValueError, TypeError):
+        f3_short_int = 0
+    if f3_short_int > 0:
+        items.append(
+            f"未来3天应发：**{report.get('未来3天应发货订单数', '-')}** 单　|　"
+            f"缺货风险：**{f3_short}** 单 ⚠️ 建议提前协调"
+        )
+    else:
+        items.append(
+            f"未来3天应发：**{report.get('未来3天应发货订单数', '-')}** 单　|　"
+            f"缺货风险：**{f3_short}** 单"
+        )
 
     return {
         "config": {"wide_screen_mode": True},
@@ -2808,7 +3851,7 @@ def _build_report_card(report: dict) -> dict:
 
 
 def _build_inventory_card() -> dict:
-    """库存状态卡片。"""
+    """库存状态卡片 — 风险分级：高风险缺货 / 中风险预警 / 正常。"""
     inv = data_cache.get("inv")
     sku_df = data_cache.get("sku")
     items_df = data_cache.get("items")
@@ -2817,32 +3860,78 @@ def _build_inventory_card() -> dict:
         return _error_card("库存数据未加载，请先触发排单或等待数据刷新")
 
     total_sku = inv["SKU"].nunique() if "SKU" in inv.columns else 0
-    total_qty = int(inv["库存数量"].sum()) if "库存数量" in inv.columns else 0
+    raw_qty = float(inv["库存数量"].sum()) if "库存数量" in inv.columns else 0.0
+    # 安全上限：防止数据异常导致显示天文数字
+    total_qty = int(raw_qty) if raw_qty < 1_000_000_000 else int(inv["库存数量"].apply(to_num).sum())
 
-    # 缺货 SKU（从明细表统计）
+    # 缺货 SKU（高风险）
     shortage_list: List[tuple] = []
+    # 低库存 SKU（中风险预警）
+    warning_list: List[tuple] = []
     if items_df is not None and not items_df.empty and "库存状态" in items_df.columns and "SKU编码" in items_df.columns:
         shortage_items = items_df[items_df["库存状态"].astype(str).str.strip() == "缺货"]
         if not shortage_items.empty:
             gap_by_sku: Dict[str, float] = {}
             for _, r in shortage_items.iterrows():
                 sku = safe_str(r.get("SKU编码", ""))
+                if not sku:
+                    sku = safe_str(r.get("产品名称", "")) or safe_str(r.get("规格", ""))
                 gap = to_num(r.get("缺口数量", 0))
                 if sku and gap > 0:
                     gap_by_sku[sku] = gap_by_sku.get(sku, 0) + gap
             shortage_list = sorted(gap_by_sku.items(), key=lambda x: x[1], reverse=True)[:8]
 
+        # 低库存预警（库存可用量 < 5 且尚未缺货）
+        if "库存可用量" in items_df.columns:
+            warning_items = items_df[
+                (items_df["库存状态"].astype(str).str.strip() != "缺货")
+            ]
+            if not warning_items.empty:
+                warning_items = warning_items.copy()
+                warning_items["__avail"] = warning_items["库存可用量"].apply(to_num)
+                warning_items = warning_items[warning_items["__avail"] < 5]
+                warning_qty: Dict[str, float] = {}
+                for _, r in warning_items.iterrows():
+                    sku = safe_str(r.get("SKU编码", ""))
+                    if not sku:
+                        sku = safe_str(r.get("产品名称", "")) or safe_str(r.get("规格", ""))
+                    avail = to_num(r.get("库存可用量", 0))
+                    if sku and avail >= 0:
+                        warning_qty[sku] = avail
+                warning_list = sorted(warning_qty.items(), key=lambda x: x[1])[:5]
+
+    # 计算健康度（缺货SKU占总SKU比例）
+    shortage_sku_count = len(shortage_list)
+    try:
+        health_pct = int((1 - shortage_sku_count / total_sku) * 100) if total_sku > 0 else 100
+    except (ZeroDivisionError, TypeError):
+        health_pct = 100
+
+    if shortage_sku_count == 0:
+        health_level = "🟢 健康"
+        health_desc = "所有SKU库存充足"
+    elif shortage_sku_count <= total_sku * 0.05:
+        health_level = "🟡 基本健康"
+        health_desc = f"仅 {shortage_sku_count} 个SKU缺货，占比 < 5%"
+    elif shortage_sku_count <= total_sku * 0.15:
+        health_level = "🟠 需关注"
+        health_desc = f"{shortage_sku_count} 个SKU缺货，建议尽快补货"
+    else:
+        health_level = "🔴 高风险"
+        health_desc = f"{shortage_sku_count} 个SKU缺货，需立即采购"
+
     lines = [
-        f"📦 **库存总览**",
+        f"📦 **库存健康度** — {health_level}",
         "",
-        f"SKU总数：**{total_sku}**　|　总库存量：**{total_qty:,}**",
+        f"**{health_desc}**",
+        f"总SKU **{total_sku}** 类　|　总库存 **{total_qty:,}** 个　|　健康度 **{health_pct}%**",
     ]
 
+    # --- 高风险：缺货物料 ---
     if shortage_list:
         lines.append("")
-        lines.append("🔴 **缺货物料 TOP{0}**".format(min(len(shortage_list), 8)))
+        lines.append("━━━ 🔴 缺货物料（立即处理）━━━")
         for sku_code, gap in shortage_list:
-            # 尝试从 SKU 表获取设备名称
             name = ""
             if sku_df is not None and not sku_df.empty and "产品编码SKU" in sku_df.columns:
                 match = sku_df[sku_df["产品编码SKU"].astype(str).str.strip() == sku_code]
@@ -2853,18 +3942,43 @@ def _build_inventory_card() -> dict:
             lines.append(f"• **{display}** — 缺 **{gap_str}** 个")
     else:
         lines.append("")
-        lines.append("✅ 当前无缺货物料")
+        lines.append("✅ 无需立即处理的缺货物料")
+
+    # --- 中风险：低库存预警 ---
+    if warning_list:
+        lines.append("")
+        lines.append("━━━ 🟡 库存偏低（关注补货）━━━")
+        for sku_code, avail in warning_list:
+            name = ""
+            if sku_df is not None and not sku_df.empty and "产品编码SKU" in sku_df.columns:
+                match = sku_df[sku_df["产品编码SKU"].astype(str).str.strip() == sku_code]
+                if not match.empty:
+                    name = safe_str(match.iloc[0].get("设备名称", ""))
+            display = name if name else sku_code
+            avail_str = str(int(avail)) if avail == int(avail) else str(round(avail, 1))
+            lines.append(f"• **{display}** — 仅剩 {avail_str} 个")
+    else:
+        lines.append("")
+        lines.append("🟢 当前无库存偏低预警")
+
+    # 确定卡片颜色
+    if shortage_list:
+        header_color = "red"
+    elif warning_list:
+        header_color = "orange"
+    else:
+        header_color = "green"
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "red" if shortage_list else "green",
+        "header": {"template": header_color,
                     "title": {"content": "📦 库存状态", "tag": "plain_text"}},
         "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
     }
 
 
 def _build_pending_orders_card() -> dict:
-    """待确认订单列表。"""
+    """待确认订单列表 — 按紧急度排序，标注发货时限。"""
     try:
         summary = prepare_summary_status(fetch_bitable_to_df(TABLE_ID_DETAIL))
     except Exception:
@@ -2882,26 +3996,75 @@ def _build_pending_orders_card() -> dict:
         return {"header": {"template": "green", "title": {"content": "✅ 待确认订单", "tag": "plain_text"}},
                 "elements": [{"tag": "markdown", "content": "当前没有待确认的订单，所有订单已处理。"}]}
 
-    pending = pending.head(15)
-    lines = [f"📋 **待确认订单 — {len(pending)} 份**", ""]
+    # 构建跳转链接
+    bitable_url = (
+        f"https://wl6wihmop1.feishu.cn/base/{BITABLE_APP_TOKEN}"
+        f"?table={TABLE_ID_DETAIL}&view=vewiuVK8pH"
+    )
+
+    today = datetime.now(timezone(timedelta(hours=8)))
+
+    # 计算紧急度并排序
+    def _urgency_score(row):
+        d = parse_date_to_date(row.get("AI建议发货时间"))
+        if d is not None:
+            days_diff = (d - today.date()).days
+            # 超期越多分数越高（越紧急）
+            return -max(days_diff, -365)
+        return 0
+
+    pending = pending.copy()
+    pending["__urgency"] = pending.apply(_urgency_score, axis=1)
+    pending = pending.sort_values("__urgency", ascending=False).head(15)
+
+    pending_count = len(summary[summary["订单状态"] == "待确认"]) if "订单状态" in summary.columns else len(pending)
+    lines = [f"📋 **待确认订单**　（共 {pending_count} 份待处理）", ""]
+
     for _, r in pending.iterrows():
         cid = safe_str(r.get("合同编号", "-"))
         status = safe_str(r.get("整体状态", ""))
-        ship = safe_str(r.get("AI建议发货时间", ""))
-        if len(ship) >= 10:
-            ship = ship[:10]
-        flag = "🔴" if "缺货" in status else "🟢"
-        lines.append(f"{flag} {cid} — {ship}")
+        d = parse_date_to_date(r.get("AI建议发货时间"))
+        ship_display = date_to_yyyy_mm_dd(d) if d else "待定"
+
+        # 紧急度标注
+        urgency_tag = ""
+        if d:
+            days_diff = (d - today.date()).days
+            if days_diff < 0:
+                urgency_tag = " ⚠️ 已超期"
+            elif days_diff == 0:
+                urgency_tag = " 🚨 今日应发"
+            elif days_diff <= 3:
+                urgency_tag = f" ⏰ {days_diff}天内"
+
+        if "缺货" in status:
+            flag = "🔴"
+            note = " [需协调物料]"
+        else:
+            flag = "🟡"
+            note = ""
+
+        lines.append(f"{flag} {cid} — 发货 {ship_display}{urgency_tag}{note}")
+
+    lines.append("")
+    lines.append("💡 **提示**：建议优先确认「已超期」和「今日应发」的订单。")
 
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": "orange", "title": {"content": "📋 待确认订单", "tag": "plain_text"}},
-        "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+        "elements": [
+            {"tag": "markdown", "content": "\n".join(lines)},
+            {"tag": "hr"},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "📋 前往人工确认"},
+                 "type": "primary", "url": bitable_url, "value": {}}
+            ]},
+        ],
     }
 
 
 def _build_delayed_orders_card() -> dict:
-    """延迟订单列表。"""
+    """延迟订单列表 — 影响评估 + 延迟严重程度分级。"""
     try:
         summary = prepare_summary_status(fetch_bitable_to_df(TABLE_ID_DETAIL))
     except Exception:
@@ -2911,18 +4074,83 @@ def _build_delayed_orders_card() -> dict:
         return {"header": {"template": "blue", "title": {"content": "⏳ 延迟订单", "tag": "plain_text"}},
                 "elements": [{"tag": "markdown", "content": "暂无延迟订单数据"}]}
 
-    delayed = summary[summary["整体状态"].astype(str).str.strip() == "缺货"].head(15)
+    delayed = summary[summary["整体状态"].astype(str).str.strip() == "缺货"].copy()
     if delayed.empty:
         return {"header": {"template": "green", "title": {"content": "✅ 交付状态", "tag": "plain_text"}},
                 "elements": [{"tag": "markdown", "content": "当前所有订单交付正常，无延迟订单。"}]}
 
-    lines = [f"⚠️ **缺货/延迟订单 — {len(delayed)} 份**", ""]
+    today = datetime.now(timezone(timedelta(hours=8)))
+
+    # 影响评估：统计严重程度
+    critical_cnt, high_cnt = 0, 0
+    for _, r in delayed.iterrows():
+        d = parse_date_to_date(r.get("AI建议发货时间"))
+        if d is not None:
+            days_diff = (d - today.date()).days
+            if days_diff < -7:
+                critical_cnt += 1
+            elif days_diff < 0:
+                high_cnt += 1
+
+    lines = [f"⚠️ **缺货/延迟订单**　（共 {len(delayed)} 份受影响）", ""]
+
+    # 影响评估摘要
+    if critical_cnt > 0 or high_cnt > 0:
+        impact_parts = []
+        if critical_cnt > 0:
+            impact_parts.append(f"🔴 **严重**：{critical_cnt} 份超期超过7天")
+        if high_cnt > 0:
+            impact_parts.append(f"🟠 **关注**：{high_cnt} 份超期7天内")
+        lines.append(f"📊 **影响评估**：{'  ｜  '.join(impact_parts)}")
+        lines.append("")
+
+    # 按超期天数降序排列
+    delayed = delayed.copy()
+    def _calc_overdue(row):
+        d = parse_date_to_date(row.get("AI建议发货时间"))
+        if d is None:
+            return -9999  # 没有日期的排最后
+        return -(d - today.date()).days  # 负值→超期，取反→超期越多值越大
+
+    delayed["__overdue"] = delayed.apply(_calc_overdue, axis=1)
+    delayed = delayed.sort_values("__overdue", ascending=False).head(15)
+
     for _, r in delayed.iterrows():
         cid = safe_str(r.get("合同编号", "-"))
-        ship = safe_str(r.get("AI建议发货时间", ""))[:10]
-        manual = safe_str(r.get("人工确认发货时间", ""))[:10]
-        display_ship = manual if manual else ship
-        lines.append(f"🔴 {cid} — 预计 {display_ship}")
+        proj = safe_str(r.get("项目名称", ""))
+        owner = safe_str(r.get("客户名称", ""))
+        ai_d = parse_date_to_date(r.get("AI建议发货时间"))
+        manual_d = parse_date_to_date(r.get("人工确认发货时间"))
+        display_date = manual_d or ai_d
+        display_ship = date_to_yyyy_mm_dd(display_date) if display_date else "待定"
+
+        # 延迟严重程度
+        severity = "🔴"
+        note = ""
+        if display_date:
+            days_over = (today.date() - display_date).days
+            if days_over > 7:
+                severity = "🔴🔴"
+                note = f"已超期 {days_over} 天，建议升级"
+            elif days_over > 0:
+                severity = "🔴"
+                note = f"已超期 {days_over} 天"
+            else:
+                severity = "🟠"
+                note = "即将到期"
+
+        line = f"{severity} **{cid}**"
+        if proj:
+            line += f"　|　{proj[:25]}"
+        line += f"　|　预计 {display_ship}"
+        if owner:
+            line += f"　|　👤 {owner[:12]}"
+        if note:
+            line += f"\n　→ {note}"
+        lines.append(line)
+
+    lines.append("")
+    lines.append("💡 **建议**：超期订单请优先协调物料与产线排期，尽早确认发货时间。")
 
     return {
         "config": {"wide_screen_mode": True},
@@ -2932,7 +4160,7 @@ def _build_delayed_orders_card() -> dict:
 
 
 def _build_contract_card(contract_id: str) -> dict:
-    """单个合同详情卡片。"""
+    """单个合同详情卡片 — 含项目名称、交付时间线、AI洞察。"""
     try:
         detail_df = fetch_bitable_to_df(TABLE_ID_DETAIL)
     except Exception:
@@ -2947,57 +4175,107 @@ def _build_contract_card(contract_id: str) -> dict:
                 "elements": [{"tag": "markdown", "content": f"未找到合同编号 **{contract_id}**，请确认编号是否正确"}]}
 
     r = match.iloc[0]
+    project = safe_str(r.get("项目名称", ""))
     status = safe_str(r.get("整体状态", "-"))
     order_status = safe_str(r.get("订单状态", "-"))
-    ai_ship = safe_str(r.get("AI建议发货时间", ""))[:10]
-    manual_ship = safe_str(r.get("人工确认发货时间", ""))[:10]
+    ai_date = parse_date_to_date(r.get("AI建议发货时间"))
+    manual_date = parse_date_to_date(r.get("人工确认发货时间"))
     risk = safe_str(r.get("AI风险", ""))
     advice = safe_str(r.get("AI建议", ""))
 
-    status_emoji = "🟢" if "有货" in status else "🔴" if "缺货" in status else "⚪"
-    ship_display = manual_ship if manual_ship else ai_ship if ai_ship else "待定"
+    today = datetime.now(timezone(timedelta(hours=8)))
+    display_date = manual_date or ai_date
+    ship_display = date_to_yyyy_mm_dd(display_date) if display_date else "待定"
+
+    # 订单状态
+    if order_status == "已发货":
+        status_emoji, status_label = "🚚", "已发出"
+    elif order_status == "已确认":
+        status_emoji, status_label = "🟢", "已确认"
+    else:
+        status_emoji, status_label = "🟡", "待确认"
+
+    # 库存状态
+    has_shortage = "缺货" in status
+    stock_emoji = "🔴" if has_shortage else "🟢" if "有货" in status else "⚪"
+    stock_label = "物料待齐" if has_shortage else "物料充足" if "有货" in status else status
 
     lines = [
         f"📄 **合同 {contract_id}**",
-        "",
-        f"整体状态：{status_emoji} **{status}**",
-        f"订单状态：**{order_status}**",
-        f"预计发货：**{ship_display}**",
     ]
-    if manual_ship:
-        lines.append(f"人工确认发货时间：**{manual_ship}**")
-    if risk:
-        lines.append(f"AI风险提示：{risk}")
-    if advice:
-        lines.append(f"AI建议：{advice}")
+    if project:
+        lines.append(f"🏷️ 项目：**{project}**")
+    lines.append("")
+    lines.append(f"订单状态：{status_emoji} **{status_label}**")
+    lines.append(f"库存状态：{stock_emoji} **{stock_label}**")
+    lines.append(f"预计发货：**{ship_display}**")
+    if manual_date:
+        lines.append(f"（人工确认发货时间：**{date_to_yyyy_mm_dd(manual_date)}**）")
+
+    # 交付时间线分析
+    if display_date:
+        days_diff = (display_date - today.date()).days
+        lines.append("")
+        if days_diff < 0:
+            lines.append(f"⏰ **已超期 {-days_diff} 天**，建议尽快协调确认")
+        elif days_diff == 0:
+            lines.append("🚨 **今日应发**，请确认发货安排")
+        elif days_diff <= 7:
+            lines.append(f"📅 **{days_diff} 天内**发货，请关注备货进度")
+        else:
+            lines.append(f"📅 距发货还有 **{days_diff} 天**")
+
+    # AI 洞察
+    if risk or advice:
+        lines.append("")
+        lines.append("━━━ **AI 洞察** ━━━")
+        if risk:
+            lines.append(f"📋 **风险提示**：{risk}")
+        if advice:
+            lines.append(f"💡 **建议**：{advice}")
 
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "blue", "title": {"content": "📄 订单详情", "tag": "plain_text"}},
+        "header": {"template": "red" if has_shortage else "blue",
+                    "title": {"content": "📄 订单详情", "tag": "plain_text"}},
         "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
     }
 
 
 def _build_default_card() -> dict:
-    """默认引导卡片。"""
+    """默认引导卡片 — 输入无法识别时给出明确提示。"""
     return {
         "header": {"template": "blue", "title": {"content": "🏭 供应链AI助手", "tag": "plain_text"}},
         "elements": [{"tag": "markdown", "content": (
-            "我是供应链AI助手，帮你掌握订单排单和交付全貌。\n\n"
-            "📊 **常用指令**\n"
-            "• **日报** — 今日排单统计\n"
-            "• **库存** — 库存与缺货物料\n"
-            "• **待确认** — 待处理的排单\n"
-            "• **延迟** — 延迟/缺货订单\n"
-            "• **合同编号** — 查具体订单\n\n"
-            "👇 直接输入关键词即可查询"
+            "您好，我是供应链AI助手，为您提供排单、库存与交付管理服务。\n\n"
+            "📊 **常用查询**\n"
+            "• **日报** — 今日排单统计与交付概览\n"
+            "• **库存** — 库存状态与缺货物料明细\n"
+            "• **待确认** — 待人工确认的订单列表\n"
+            "• **延迟** — 预计延迟或缺货的订单\n\n"
+            "🔍 **快速查询**\n"
+            "• 直接输入**合同编号**查询订单详情\n"
+            "• 发送**飞书文档链接**进行智能分析\n\n"
+            "💡 未能识别您输入的内容，请尝试以上关键词或指令。"
         )}],
     }
 
 
 def _error_card(msg: str) -> dict:
-    return {"header": {"template": "red", "title": {"content": "⚠️ 查询失败", "tag": "plain_text"}},
-            "elements": [{"tag": "markdown", "content": str(msg)}]}
+    friendly_msg = str(msg)
+    # 去掉错误类型前缀（如"读取日报失败: "），保留具体原因
+    if ": " in friendly_msg:
+        parts = friendly_msg.split(": ", 1)
+        friendly_msg = parts[1].strip() if parts[1].strip() else parts[0].strip()
+
+    return {
+        "header": {"template": "red", "title": {"content": "⚠️ 查询异常", "tag": "plain_text"}},
+        "elements": [{"tag": "markdown", "content": (
+            f"查询过程遇到异常，请稍后重试。\n\n"
+            f"🔍 {friendly_msg}\n\n"
+            f"如问题持续，请联系技术支持。"
+        )}],
+    }
 
 
 @app.post("/webhook/feishu")
@@ -3042,7 +4320,8 @@ async def feishu_webhook(request: Request):
         print(f"[Webhook] 忽略非消息事件: event_type={event_type}")
         return {"msg": "ok"}
 
-    # ---- 提取消息字段（兼容 V1 / V2） ----
+    # ---- 提取消息字段（兼容 V1 / V2），同时获取 chat_id 用于群聊回复 ----
+    chat_id = ""
     if header and "message" in event:
         # V2 格式
         message = event.get("message", {})
@@ -3051,6 +4330,7 @@ async def feishu_webhook(request: Request):
         open_id = sender_id_obj.get("open_id", "")
         sender_type = sender.get("sender_type", "")
         chat_type = message.get("chat_type", "")
+        chat_id = message.get("chat_id", "")
         message_type = message.get("message_type", "")
         content_str = message.get("content", "{}")
         message_id = message.get("message_id", "")
@@ -3064,6 +4344,7 @@ async def feishu_webhook(request: Request):
         open_id = event.get("open_id", "")
         sender_type = event.get("sender_type", "user")
         chat_type = event.get("chat_type", "")
+        chat_id = event.get("chat_id", "")
         message_type = event.get("msg_type", "text")
         user_input = (event.get("text") or "").strip()
         message_id = event.get("open_message_id", "")
@@ -3077,8 +4358,8 @@ async def feishu_webhook(request: Request):
     print(f"[Webhook] text={user_input[:100] if user_input else '(空)'}")
 
     # ---- 过滤 ----
-    if chat_type and chat_type != "p2p":
-        print(f"[Webhook] 跳过非私聊: chat_type={chat_type}")
+    if chat_type and chat_type not in ("p2p", "group"):
+        print(f"[Webhook] 跳过未知聊天类型: chat_type={chat_type}")
         return {"msg": "ok"}
     if sender_type and sender_type != "user":
         print(f"[Webhook] 跳过非用户: sender_type={sender_type}")
@@ -3089,8 +4370,15 @@ async def feishu_webhook(request: Request):
     if not open_id:
         print("[Webhook] open_id 为空, 无法回复")
         return {"msg": "ok"}
+
+    # 群聊中剥离 @提及
+    user_input = user_input.strip()
+    if chat_type == "group" and user_input:
+        import re as _re
+        user_input = _re.sub(r"@\S+", "", user_input).strip()
+        user_input = _re.sub(r"@所有人", "", user_input).strip()
     if not user_input:
-        print("[Webhook] 消息文本为空")
+        print("[Webhook] 消息文本为空（或仅含 @提及）")
         return {"msg": "ok"}
 
     # ---- 去重 ----
@@ -3111,7 +4399,7 @@ async def feishu_webhook(request: Request):
             # 订单查询助手 (cli_aa87f7619df8dbb3) 或未知 → 客户订单查询
             from customer_agent import process_message as bot_process_message
             card = bot_process_message(open_id, user_input)
-        _send_bot_reply(open_id, card, app_id=event_app_id)
+        _send_bot_reply(open_id, card, app_id=event_app_id, chat_id=chat_id, chat_type=chat_type)
     except Exception as e:
         print(f"[Webhook] 处理异常: {e}")
         import traceback
