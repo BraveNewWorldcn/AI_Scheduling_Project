@@ -1048,7 +1048,7 @@ def _sync_finance_detail() -> Dict[str, Any]:
     if to_update:
         update_df = pd.DataFrame(to_update)
         update_bitable_records(TABLE_ID_FINANCE_DETAIL, update_df, record_id_col="_record_id",
-                               numeric_cols={"合同数量"})
+                               numeric_cols={"合同数量", "包干合同单采数量", "小计"})
 
     if to_create:
         create_df = pd.DataFrame(to_create)
@@ -1129,6 +1129,10 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
         if not contract_no or contract_no in locked_contracts:
             continue
 
+        # 项目类型未设置：不做检查，留空让用户先设置
+        if not project_type:
+            continue
+
         if project_type != "包干":
             summary_check[contract_no] = "正常"
             continue
@@ -1203,10 +1207,11 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
         else:
             summary_check[contract_no] = "正常"
 
-    # 单采项目的费用检查设为正常
+    # 单采项目标记为正常
     for _, summary_row in summary_df.iterrows():
         contract_no = safe_str(summary_row.get("合同编号", ""))
-        if contract_no and contract_no not in summary_check and contract_no not in locked_contracts:
+        project_type = safe_str(summary_row.get("项目类型", ""))
+        if contract_no and contract_no not in summary_check and contract_no not in locked_contracts and project_type == "单采":
             summary_check[contract_no] = "正常"
 
     # 将补行合并到明细表 DataFrame
