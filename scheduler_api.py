@@ -106,6 +106,10 @@ TABLE_ID_RESERVATION = os.getenv("TABLE_ID_RESERVATION", "")
 TABLE_ID_MAIN = os.getenv("TABLE_ID_MAIN", "")
 TABLE_ID_SHIPPING = os.getenv("TABLE_ID_SHIPPING", "")
 TABLE_ID_DAILY_REPORT = os.getenv("TABLE_ID_DAILY_REPORT", "")
+# 财务核算模块表 ID
+TABLE_ID_FINANCE_SUMMARY = os.getenv("TABLE_ID_FINANCE_SUMMARY", "")      # 财务对账总表
+TABLE_ID_BILLING_RULES = os.getenv("TABLE_ID_BILLING_RULES", "")          # 产品计费规则主表
+TABLE_ID_FINANCE_DETAIL = os.getenv("TABLE_ID_FINANCE_DETAIL", "")        # 财务对账明细表
 
 # ===== 输出表字段映射 =====
 OUTPUT_SUMMARY_FIELDS_MAP = {
