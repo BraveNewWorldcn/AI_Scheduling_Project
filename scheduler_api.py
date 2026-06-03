@@ -808,9 +808,11 @@ def upsert_bitable_records_by_key(
 def _sync_finance_summary() -> Dict[str, Any]:
     """同步销售订单主表 → 财务对账总表（Upsert by 合同编号）。
 
-    同步字段：合同编号、下单日期、客户名称、项目名称、代理商。
+    同步字段：合同编号、下单日期、客户名称、项目名称、商务、代理商。
     保留字段（不覆盖）：项目类型、备注、AI项目金额、人工核对金额、AI费用检查。
     """
+    if not TABLE_ID_FINANCE_SUMMARY:
+        return {"ok": False, "error": "未配置 TABLE_ID_FINANCE_SUMMARY，请在 .env 中设置"}
     try:
         main_df = fetch_bitable_to_df(TABLE_ID_MAIN)
     except Exception as e:
@@ -825,6 +827,7 @@ def _sync_finance_summary() -> Dict[str, Any]:
         "下单日期": "下单日期",
         "客户名称": "客户名称",
         "项目名称": "项目名称",
+        "商务": "商务",
         "代理商": "代理商",
     }
 
@@ -832,6 +835,10 @@ def _sync_finance_summary() -> Dict[str, Any]:
     available_cols = [c for c in FIELD_MAP if c in main_df.columns]
     if "合同编号" not in available_cols:
         return {"ok": False, "error": "销售订单主表缺少「合同编号」字段"}
+
+    skipped_cols = [c for c in FIELD_MAP if c not in main_df.columns]
+    if skipped_cols:
+        print(f"[WARN] 主表缺少字段，跳过同步: {skipped_cols}")
 
     sync_df = main_df[available_cols].copy()
 
@@ -911,6 +918,8 @@ def _sync_finance_detail() -> Dict[str, Any]:
     - 从计费规则表（按产品名称+规格匹配）：Spec_ID
     - 从对账总表（按合同编号关联）：合同类型
     """
+    if not TABLE_ID_FINANCE_DETAIL:
+        return {"ok": False, "error": "未配置 TABLE_ID_FINANCE_DETAIL，请在 .env 中设置"}
     try:
         items_df = fetch_bitable_to_df(TABLE_ID_ITEMS)
     except Exception as e:
@@ -1057,6 +1066,12 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
     4. 按合同逐条核算（包干/单采分类）
     5. 汇总回写 AI项目金额
     """
+    if not TABLE_ID_FINANCE_SUMMARY:
+        return {"ok": False, "error": "未配置 TABLE_ID_FINANCE_SUMMARY，请在 .env 中设置"}
+    if not TABLE_ID_FINANCE_DETAIL:
+        return {"ok": False, "error": "未配置 TABLE_ID_FINANCE_DETAIL，请在 .env 中设置"}
+    if not TABLE_ID_BILLING_RULES:
+        return {"ok": False, "error": "未配置 TABLE_ID_BILLING_RULES，请在 .env 中设置"}
     # 读取数据
     try:
         summary_df = fetch_bitable_to_df(TABLE_ID_FINANCE_SUMMARY)
