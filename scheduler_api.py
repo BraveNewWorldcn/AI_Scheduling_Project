@@ -1042,6 +1042,294 @@ def _sync_finance_detail() -> Dict[str, Any]:
     return {"ok": True, "synced": len(sync_rows), "updated": len(to_update), "created": len(to_create)}
 
 
+def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
+    """执行完整财务核算流程。
+
+    流程：
+    1. 读取三张财务表 + 计费规则表
+    2. 锁定检查（人工核对金额已填写的合同跳过）
+    3. 包干项目完整性检查（自动补行）
+    4. 按合同逐条核算（包干/单采分类）
+    5. 汇总回写 AI项目金额
+    """
+    # 读取数据
+    try:
+        summary_df = fetch_bitable_to_df(TABLE_ID_FINANCE_SUMMARY)
+        detail_df = fetch_bitable_to_df(TABLE_ID_FINANCE_DETAIL)
+        billing_df = fetch_bitable_to_df(TABLE_ID_BILLING_RULES)
+    except Exception as e:
+        return {"ok": False, "error": f"读取飞书数据失败: {e}"}
+
+    if summary_df.empty:
+        return {"ok": False, "error": "财务对账总表无数据，请先同步"}
+
+    if detail_df.empty:
+        return {"ok": False, "error": "财务对账明细表无数据，请先同步"}
+
+    if billing_df.empty:
+        return {"ok": False, "error": "产品计费规则主表无数据，请先维护"}
+
+    # 构建计费规则查找索引（Spec_ID → 规则行）
+    billing_index: Dict[str, Dict[str, Any]] = {}
+    if "Spec_ID" in billing_df.columns:
+        for _, r in billing_df.iterrows():
+            sid = safe_str(r.get("Spec_ID", ""))
+            if sid:
+                billing_index[sid] = {
+                    "计费方式": safe_str(r.get("计费方式", "")),
+                    "包干阈值": safe_numeric(r.get("包干阈值", 0)),
+                    "单采单价": safe_numeric(r.get("单采单价", 0)),
+                }
+
+    # 锁定合同列表
+    locked_contracts: Set[str] = set()
+    if "人工核对金额" in summary_df.columns and "合同编号" in summary_df.columns:
+        for _, r in summary_df.iterrows():
+            amt = r.get("人工核对金额")
+            if pd.notna(amt) and safe_numeric(amt) != 0:
+                contract = safe_str(r.get("合同编号", ""))
+                if contract:
+                    locked_contracts.add(contract)
+
+    # 新增明细行（完整性检查产生）
+    new_detail_rows: List[Dict[str, Any]] = []
+    # 需要更新的总表备注
+    summary_remarks: Dict[str, str] = {}  # contract_no → new_remark
+    # 费用检查结果
+    summary_check: Dict[str, str] = {}  # contract_no → check_result
+
+    # ========== 步骤1: 包干项目完整性检查 ==========
+    for _, summary_row in summary_df.iterrows():
+        contract_no = safe_str(summary_row.get("合同编号", ""))
+        project_type = safe_str(summary_row.get("项目类型", ""))
+
+        if not contract_no or contract_no in locked_contracts:
+            continue
+
+        if project_type != "包干":
+            summary_check[contract_no] = "正常"
+            continue
+
+        # 获取该合同所有明细行
+        contract_detail = detail_df[
+            detail_df["合同编号"].astype(str).str.strip() == contract_no
+        ]
+
+        check_msgs = []
+
+        # 检查「消防远程控制服务费」
+        has_service_fee = any(
+            safe_str(r.get("产品名称", "")) == "消防远程控制服务费"
+            for _, r in contract_detail.iterrows()
+        )
+        if not has_service_fee:
+            new_detail_rows.append({
+                "合同编号": contract_no,
+                "项目名称": safe_str(summary_row.get("项目名称", "")),
+                "产品名称": "消防远程控制服务费",
+                "规格": "定制",
+                "合同数量": 1,
+                "合同类型": "包干",
+            })
+            check_msgs.append("缺少「消防远程控制服务费」，已自动补行")
+
+        # 检查「消防远程控制包干费」
+        has_package_fee = any(
+            safe_str(r.get("产品名称", "")) == "消防远程控制包干费"
+            for _, r in contract_detail.iterrows()
+        )
+        if not has_package_fee:
+            new_detail_rows.append({
+                "合同编号": contract_no,
+                "项目名称": safe_str(summary_row.get("项目名称", "")),
+                "产品名称": "消防远程控制包干费",
+                "规格": "定制",
+                "合同数量": 1,
+                "合同类型": "包干",
+            })
+            check_msgs.append("缺少「消防远程控制包干费」，已自动补行")
+
+        # 检查 SPEC-RB800-KZP 合计 > 阈值
+        rb800_total = 0
+        for _, r in contract_detail.iterrows():
+            if safe_str(r.get("Spec_ID", "")) == "SPEC-RB800-KZP":
+                rb800_total += safe_numeric(r.get("合同数量", 0))
+        # 也加上刚补行的
+        for nr in new_detail_rows:
+            if nr["合同编号"] == contract_no and nr.get("Spec_ID") == "SPEC-RB800-KZP":
+                rb800_total += safe_numeric(nr.get("合同数量", 0))
+
+        if rb800_total > threshold:
+            new_detail_rows.append({
+                "合同编号": contract_no,
+                "项目名称": safe_str(summary_row.get("项目名称", "")),
+                "产品名称": "消防远程控制设备费",
+                "规格": "SPEC-EQP",
+                "合同数量": rb800_total - threshold,
+                "合同类型": "包干",
+            })
+            existing_remark = safe_str(summary_row.get("备注", ""))
+            new_remark = "AI巡查增加设备费用"
+            if new_remark not in existing_remark:
+                summary_remarks[contract_no] = (existing_remark + "；" + new_remark).strip("；")
+            check_msgs.append(f"SPEC-RB800-KZP 合计 {rb800_total} > {threshold}，已增加设备费用行")
+
+        # 汇总费用检查结果
+        if check_msgs:
+            summary_check[contract_no] = "；".join(check_msgs)
+        else:
+            summary_check[contract_no] = "正常"
+
+    # 单采项目的费用检查设为正常
+    for _, summary_row in summary_df.iterrows():
+        contract_no = safe_str(summary_row.get("合同编号", ""))
+        if contract_no and contract_no not in summary_check and contract_no not in locked_contracts:
+            summary_check[contract_no] = "正常"
+
+    # 将补行合并到明细表 DataFrame
+    if new_detail_rows:
+        new_df = pd.DataFrame(new_detail_rows)
+        detail_df = pd.concat([detail_df, new_df], ignore_index=True)
+
+    # ========== 步骤2: 按合同逐条核算 ==========
+    # 构建总表合同索引
+    summary_index: Dict[str, Any] = {}
+    if "合同编号" in summary_df.columns:
+        for _, r in summary_df.iterrows():
+            cno = safe_str(r.get("合同编号", ""))
+            if cno:
+                summary_index[cno] = r
+
+    calc_results: List[Dict[str, Any]] = []  # 明细写回数据
+
+    for _, detail_row in detail_df.iterrows():
+        contract_no = safe_str(detail_row.get("合同编号", ""))
+        spec_id = safe_str(detail_row.get("Spec_ID", ""))
+        qty = safe_numeric(detail_row.get("合同数量", 0))
+
+        if contract_no in locked_contracts:
+            continue
+
+        sum_row = summary_index.get(contract_no)
+        if sum_row is None:
+            continue
+
+        project_type = safe_str(sum_row.get("项目类型", ""))
+        rule = billing_index.get(spec_id, {})
+
+        is_baogan = "否"
+        single_qty = 0
+        unit_price = 0.0
+        subtotal = 0.0
+
+        if project_type == "单采":
+            # 全部按单采计算
+            unit_price = safe_numeric(rule.get("单采单价", 0))
+            single_qty = qty
+            subtotal = qty * unit_price
+            is_baogan = "否"
+
+        elif project_type == "包干":
+            billing_method = rule.get("计费方式", "")
+            baogan_threshold = safe_numeric(rule.get("包干阈值", 0))
+
+            if billing_method == "单采" and baogan_threshold == 0:
+                # 单采设备
+                unit_price = safe_numeric(rule.get("单采单价", 0))
+                single_qty = qty
+                subtotal = qty * unit_price
+                is_baogan = "否"
+            else:
+                # 包干产品
+                is_baogan = "是"
+                if qty <= baogan_threshold:
+                    # 阈值内：价格为0
+                    unit_price = 0.0
+                    single_qty = 0
+                    subtotal = 0.0
+                else:
+                    # 阈值外
+                    single_qty = qty - baogan_threshold
+                    unit_price = safe_numeric(rule.get("单采单价", 0))
+                    subtotal = single_qty * unit_price
+
+        calc_results.append({
+            "_record_id": detail_row.get("_record_id", ""),
+            "合同编号": contract_no,
+            "是否计入包干": is_baogan,
+            "包干合同单采数量": single_qty,
+            "单采价格": unit_price,
+            "小计": subtotal,
+        })
+
+    # ========== 步骤3: 汇总 AI项目金额 ==========
+    contract_totals: Dict[str, float] = defaultdict(float)
+    for cr in calc_results:
+        contract_totals[cr["合同编号"]] += cr["小计"]
+
+    # ========== 步骤4: 回写明细表 ==========
+    # 更新已有行
+    if calc_results:
+        update_df = pd.DataFrame(calc_results)
+        # 只更新已有 record_id 的行
+        existing_updates = update_df[update_df["_record_id"] != ""]
+        if not existing_updates.empty:
+            update_bitable_records(
+                TABLE_ID_FINANCE_DETAIL,
+                existing_updates,
+                record_id_col="_record_id",
+                numeric_cols={"包干合同单采数量", "单采价格", "小计"},
+            )
+
+    # 写入补行的新明细行
+    if new_detail_rows:
+        new_detail_df = pd.DataFrame(new_detail_rows)
+        write_df_to_bitable(
+            TABLE_ID_FINANCE_DETAIL,
+            new_detail_df,
+            numeric_cols={"合同数量"},
+        )
+
+    # ========== 步骤5: 回写总表（AI费用检查 + AI项目金额 + 备注）==========
+    summary_update_rows: List[Dict[str, Any]] = []
+    for _, r in summary_df.iterrows():
+        contract_no = safe_str(r.get("合同编号", ""))
+        if contract_no in locked_contracts:
+            continue
+
+        update_row = {"_record_id": r.get("_record_id", ""), "合同编号": contract_no}
+
+        if contract_no in summary_check:
+            update_row["AI费用检查"] = summary_check[contract_no]
+
+        if contract_no in summary_remarks:
+            update_row["备注"] = summary_remarks[contract_no]
+
+        if contract_no in contract_totals:
+            update_row["AI项目金额"] = contract_totals[contract_no]
+
+        summary_update_rows.append(update_row)
+
+    if summary_update_rows:
+        su_df = pd.DataFrame(summary_update_rows)
+        su_to_update = su_df[su_df["_record_id"] != ""]
+        if not su_to_update.empty:
+            update_bitable_records(
+                TABLE_ID_FINANCE_SUMMARY,
+                su_to_update,
+                record_id_col="_record_id",
+                numeric_cols={"AI项目金额"},
+            )
+
+    return {
+        "ok": True,
+        "locked_contracts": len(locked_contracts),
+        "new_detail_rows": len(new_detail_rows),
+        "calculated_rows": len(calc_results),
+        "contracts_updated": len(summary_update_rows),
+    }
+
+
 # =========================
 # 数据缓存（避免每次请求重复读取飞书）
 # =========================
