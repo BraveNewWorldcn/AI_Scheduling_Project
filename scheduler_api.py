@@ -800,6 +800,248 @@ def upsert_bitable_records_by_key(
     return None
 
 
+def _sync_finance_summary() -> Dict[str, Any]:
+    """同步销售订单主表 → 财务对账总表（Upsert by 合同编号）。
+
+    同步字段：合同编号、下单日期、客户名称、项目名称、代理商。
+    保留字段（不覆盖）：项目类型、备注、AI项目金额、人工核对金额、AI费用检查。
+    """
+    try:
+        main_df = fetch_bitable_to_df(TABLE_ID_MAIN)
+    except Exception as e:
+        return {"ok": False, "error": f"读取销售订单主表失败: {e}"}
+
+    if main_df.empty:
+        return {"ok": False, "error": "销售订单主表无数据"}
+
+    # 需要同步的字段映射：销售订单主表列名 → 对账总表列名
+    FIELD_MAP = {
+        "合同编号": "合同编号",
+        "下单日期": "下单日期",
+        "客户名称": "客户名称",
+        "项目名称": "项目名称",
+        "代理商": "代理商",
+    }
+
+    # 只取存在且需要的列
+    available_cols = [c for c in FIELD_MAP if c in main_df.columns]
+    if "合同编号" not in available_cols:
+        return {"ok": False, "error": "销售订单主表缺少「合同编号」字段"}
+
+    sync_df = main_df[available_cols].copy()
+
+    # 读取对账总表现有数据，保留人工字段
+    try:
+        existing_df = fetch_bitable_to_df(TABLE_ID_FINANCE_SUMMARY)
+    except Exception:
+        existing_df = pd.DataFrame()
+
+    preserve_cols = ["项目类型", "备注", "AI项目金额", "人工核对金额", "AI费用检查"]
+    if not existing_df.empty and "合同编号" in existing_df.columns:
+        # 按合同编号合并，保留已有的人工字段值
+        existing_preserve = existing_df[["合同编号"] + [c for c in preserve_cols if c in existing_df.columns]]
+        sync_df = sync_df.merge(existing_preserve, on="合同编号", how="left", suffixes=("", "_exist"))
+        # 用已有值覆盖
+        for col in preserve_cols:
+            exist_col = f"{col}_exist"
+            if exist_col in sync_df.columns:
+                sync_df[col] = sync_df[exist_col].fillna("")
+                sync_df.drop(columns=[exist_col], inplace=True)
+
+    err = upsert_bitable_records_by_key(
+        TABLE_ID_FINANCE_SUMMARY, sync_df,
+        key_col="合同编号", key_field_name="合同编号",
+    )
+    if err:
+        return {"ok": False, "error": err}
+
+    return {"ok": True, "synced": len(sync_df)}
+
+
+def _match_spec_id(product_name: str, spec: str, billing_df: pd.DataFrame) -> str:
+    """根据产品名称和规格匹配计费规则表中的 Spec_ID。
+
+    匹配逻辑：
+    1. 精确匹配：产品名称 == 产品名称 AND 规格 == 规格型号
+    2. 别名匹配：产品名称 包含 别名 OR 别名 包含 产品名称（模糊）
+    """
+    if billing_df.empty or not product_name or not spec:
+        return ""
+
+    product_name_norm = str(product_name).strip()
+    spec_norm = str(spec).strip()
+
+    # 1. 精确匹配
+    exact_match = billing_df[
+        (billing_df["产品名称"].astype(str).str.strip() == product_name_norm) &
+        (billing_df["规格型号"].astype(str).str.strip() == spec_norm)
+    ]
+    if not exact_match.empty:
+        val = exact_match.iloc[0].get("Spec_ID", "")
+        return str(val).strip() if pd.notna(val) else ""
+
+    # 2. 别名模糊匹配（产品名称匹配 + 规格匹配）
+    if "别名" in billing_df.columns:
+        for _, rule in billing_df.iterrows():
+            rule_spec = str(rule.get("规格型号", "")).strip()
+            if rule_spec != spec_norm:
+                continue
+            alias = str(rule.get("别名", "")).strip()
+            if not alias:
+                continue
+            # 双向包含匹配
+            if alias in product_name_norm or product_name_norm in alias:
+                val = rule.get("Spec_ID", "")
+                return str(val).strip() if pd.notna(val) else ""
+
+    return ""
+
+
+def _sync_finance_detail() -> Dict[str, Any]:
+    """同步销售订单明细表 + 主表 + 计费规则 → 财务对账明细表（Upsert by 合同编号+产品名称+规格）。
+
+    同步字段：
+    - 从明细表：合同编号、产品名称、规格、合同数量
+    - 从主表（按合同编号关联）：项目名称
+    - 从计费规则表（按产品名称+规格匹配）：Spec_ID
+    - 从对账总表（按合同编号关联）：合同类型
+    """
+    try:
+        items_df = fetch_bitable_to_df(TABLE_ID_ITEMS)
+    except Exception as e:
+        return {"ok": False, "error": f"读取销售订单明细表失败: {e}"}
+
+    if items_df.empty:
+        return {"ok": False, "error": "销售订单明细表无数据"}
+
+    # 读取主表（获取项目名称）
+    try:
+        main_df = fetch_bitable_to_df(TABLE_ID_MAIN)
+    except Exception:
+        main_df = pd.DataFrame()
+
+    # 读取计费规则表
+    try:
+        billing_df = fetch_bitable_to_df(TABLE_ID_BILLING_RULES)
+    except Exception:
+        billing_df = pd.DataFrame()
+
+    # 读取对账总表（获取合同类型 = 项目类型）
+    try:
+        summary_df = fetch_bitable_to_df(TABLE_ID_FINANCE_SUMMARY)
+    except Exception:
+        summary_df = pd.DataFrame()
+
+    # 构建同步 DataFrame
+    sync_rows = []
+    required_cols = ["合同编号", "产品名称", "规格", "合同数量"]
+    available_cols = [c for c in required_cols if c in items_df.columns]
+    if "合同编号" not in available_cols:
+        return {"ok": False, "error": "销售订单明细表缺少「合同编号」字段"}
+
+    for _, row in items_df.iterrows():
+        contract_no = safe_str(row.get("合同编号", ""))
+        product_name = safe_str(row.get("产品名称", ""))
+        spec = safe_str(row.get("规格", ""))
+        qty = row.get("合同数量", 0)
+
+        if not contract_no:
+            continue
+
+        sync_row = {
+            "合同编号": contract_no,
+            "产品名称": product_name,
+            "规格": spec,
+            "合同数量": safe_numeric(qty),
+        }
+
+        # 从主表取项目名称
+        if not main_df.empty and "合同编号" in main_df.columns and "项目名称" in main_df.columns:
+            main_match = main_df[main_df["合同编号"].astype(str).str.strip() == contract_no]
+            if not main_match.empty:
+                pn = main_match.iloc[0].get("项目名称", "")
+                sync_row["项目名称"] = safe_str(pn)
+
+        # 从计费规则匹配 Spec_ID
+        spec_id = _match_spec_id(product_name, spec, billing_df)
+        sync_row["Spec_ID"] = spec_id
+
+        # 从对账总表取合同类型
+        if not summary_df.empty and "合同编号" in summary_df.columns and "项目类型" in summary_df.columns:
+            sum_match = summary_df[summary_df["合同编号"].astype(str).str.strip() == contract_no]
+            if not sum_match.empty:
+                ct = sum_match.iloc[0].get("项目类型", "")
+                sync_row["合同类型"] = safe_str(ct)
+
+        sync_rows.append(sync_row)
+
+    if not sync_rows:
+        return {"ok": False, "error": "无有效明细数据可同步"}
+
+    sync_df = pd.DataFrame(sync_rows)
+
+    # 读取对账明细表现有数据，按 (合同编号, 产品名称, 规格) 做 key 记录已存在的 _record_id
+    try:
+        existing_detail = fetch_bitable_to_df(TABLE_ID_FINANCE_DETAIL)
+    except Exception:
+        existing_detail = pd.DataFrame()
+
+    key_to_rid: Dict[str, str] = {}
+    if not existing_detail.empty and "_record_id" in existing_detail.columns:
+        for _, r in existing_detail.iterrows():
+            k = (
+                safe_str(r.get("合同编号", "")),
+                safe_str(r.get("产品名称", "")),
+                safe_str(r.get("规格", "")),
+            )
+            rid = safe_str(r.get("_record_id", ""))
+            if all(k) and rid and k not in key_to_rid:
+                key_to_rid[k] = rid
+
+    to_update: List[Dict[str, Any]] = []
+    to_create: List[Dict[str, Any]] = []
+
+    preserve_detail_cols = ["是否计入包干", "包干合同单采数量", "单采价格", "小计"]
+    for _, row in sync_df.iterrows():
+        key = (
+            safe_str(row.get("合同编号", "")),
+            safe_str(row.get("产品名称", "")),
+            safe_str(row.get("规格", "")),
+        )
+        if not all(key):
+            continue
+
+        if key in key_to_rid:
+            # 更新：保留核算字段
+            exist_row = existing_detail[
+                (existing_detail["合同编号"].astype(str).str.strip() == key[0]) &
+                (existing_detail["产品名称"].astype(str).str.strip() == key[1]) &
+                (existing_detail["规格"].astype(str).str.strip() == key[2])
+            ]
+            d = row.to_dict()
+            d["_record_id"] = key_to_rid[key]
+            if not exist_row.empty:
+                for col in preserve_detail_cols:
+                    if col in exist_row.columns:
+                        val = exist_row.iloc[0].get(col)
+                        if pd.notna(val) and val != "":
+                            d[col] = val
+            to_update.append(d)
+        else:
+            to_create.append(row.to_dict())
+
+    if to_update:
+        update_df = pd.DataFrame(to_update)
+        update_bitable_records(TABLE_ID_FINANCE_DETAIL, update_df, record_id_col="_record_id")
+
+    if to_create:
+        create_df = pd.DataFrame(to_create)
+        create_df = create_df.drop(columns=["_record_id"], errors="ignore")
+        write_df_to_bitable(TABLE_ID_FINANCE_DETAIL, create_df)
+
+    return {"ok": True, "synced": len(sync_rows), "updated": len(to_update), "created": len(to_create)}
+
+
 # =========================
 # 数据缓存（避免每次请求重复读取飞书）
 # =========================
@@ -877,6 +1119,18 @@ def safe_str(value):
     if pd.isna(value) or value is None:
         return ""
     return str(value).strip()
+
+
+def safe_numeric(value) -> float:
+    """安全转换数值，无效值返回 0.0。"""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if not pd.isna(value) else 0.0
+    try:
+        return float(str(value).strip())
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def to_num(val) -> float:
