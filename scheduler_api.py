@@ -2234,6 +2234,7 @@ td:first-child{font-family:monospace;font-weight:600;width:100px}
 <div class="sidebar">
   <h2>AI排单服务</h2>
   <a href="/" class="active">操作面板</a>
+  <a href="/finance">财务核算</a>
   <a href="/docs">API 参考</a>
 </div>
 <div class="main">
@@ -2303,6 +2304,108 @@ async function runSchedule(){
 </body>
 </html>"""
 
+FINANCE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>财务核算</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#333;min-height:100vh;display:flex}
+.sidebar{width:240px;background:#1a1a2e;color:#eee;padding:24px 0;display:flex;flex-direction:column}
+.sidebar h2{padding:0 20px 20px;border-bottom:1px solid rgba(255,255,255,.1);margin-bottom:8px;font-size:17px}
+.sidebar a{color:#aaa;text-decoration:none;padding:10px 20px;font-size:14px;display:block}
+.sidebar a:hover,.sidebar a.active{color:#fff;background:rgba(255,255,255,.08)}
+.main{flex:1;padding:32px;max-width:960px}
+.card{background:#fff;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:28px;margin-bottom:20px}
+.card h3{font-size:18px;margin-bottom:12px}
+.card p{color:#666;line-height:1.7;margin-bottom:8px}
+.card label{font-size:14px;color:#555;margin-right:8px}
+.card input[type=number]{padding:6px 10px;border:1px solid #d0d5dd;border-radius:6px;font-size:14px;width:80px}
+.btn{display:inline-block;padding:10px 28px;border:none;border-radius:6px;font-size:15px;cursor:pointer;text-decoration:none;margin-right:8px}
+.btn-primary{background:#4f46e5;color:#fff}
+.btn-primary:hover{background:#4338ca}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.btn-secondary{background:#e5e7eb;color:#374151}
+.btn-secondary:hover{background:#d1d5db}
+#result{margin-top:16px;white-space:pre-wrap;background:#1e1e2e;color:#cdd6f4;border-radius:6px;padding:16px;font-family:'Cascadia Code',Consolas,monospace;font-size:13px;max-height:500px;overflow-y:auto;display:none}
+.status{font-size:14px;color:#888;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="sidebar">
+  <h2>AI排单服务</h2>
+  <a href="/">操作面板</a>
+  <a href="/finance" class="active">财务核算</a>
+  <a href="/docs">API 参考</a>
+</div>
+<div class="main">
+  <div class="card">
+    <h3>同步对账数据</h3>
+    <p>将销售订单主表和明细表数据同步到财务对账表，并按计费规则匹配 Spec_ID。</p>
+    <p style="color:#b45309;font-size:13px">注意：同步会更新已有数据，但保留核算结果字段。</p>
+    <button class="btn btn-primary" id="syncBtn" onclick="syncData()">同步对账数据</button>
+    <div class="status" id="syncStatus"></div>
+  </div>
+  <div class="card">
+    <h3>财务核算</h3>
+    <p>执行包干/单采分类核算，自动检查完整性并计算费用。</p>
+    <label>RB800-KZP 设备费阈值：</label>
+    <input type="number" id="threshold" value="3" min="0" step="1">
+    <p style="color:#b45309;font-size:13px;margin-top:8px">注意：人工核对金额已填写的合同将被锁定，不参与核算。</p>
+    <button class="btn btn-primary" id="calcBtn" onclick="runCalculate()">财务核算</button>
+    <div class="status" id="calcStatus"></div>
+    <pre id="result"></pre>
+  </div>
+</div>
+<script>
+async function syncData(){
+  const btn=document.getElementById('syncBtn');
+  const st=document.getElementById('syncStatus');
+  const res=document.getElementById('result');
+  btn.disabled=true;
+  st.textContent='正在同步...';
+  res.style.display='none';
+  try{
+    const r=await fetch('/finance/sync',{method:'POST'});
+    const d=await r.json();
+    res.textContent=JSON.stringify(d,null,2);
+    res.style.display='block';
+    st.textContent=d.ok?'同步完成':'同步失败';
+  }catch(e){
+    res.textContent='请求失败: '+e.message;
+    res.style.display='block';
+    st.textContent='网络错误';
+  }
+  btn.disabled=false;
+}
+
+async function runCalculate(){
+  const btn=document.getElementById('calcBtn');
+  const st=document.getElementById('calcStatus');
+  const res=document.getElementById('result');
+  const threshold=parseInt(document.getElementById('threshold').value)||3;
+  btn.disabled=true;
+  st.textContent='正在核算，请稍候...';
+  res.style.display='none';
+  try{
+    const r=await fetch('/finance/calculate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold})});
+    const d=await r.json();
+    res.textContent=JSON.stringify(d,null,2);
+    res.style.display='block';
+    st.textContent=d.ok?'核算完成':'核算失败';
+  }catch(e){
+    res.textContent='请求失败: '+e.message;
+    res.style.display='block';
+    st.textContent='网络错误';
+  }
+  btn.disabled=false;
+}
+</script>
+</body>
+</html>"""
+
 
 @app.get("/")
 def home():
@@ -2314,6 +2417,12 @@ def home():
 def api_docs():
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=HOME_HTML)
+
+
+@app.get("/finance")
+def finance_page():
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=FINANCE_HTML)
 
 
 def delete_all_records(table_id: str) -> int:
