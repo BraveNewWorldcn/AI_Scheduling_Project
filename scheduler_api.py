@@ -863,6 +863,7 @@ def _sync_finance_summary() -> Dict[str, Any]:
     err = upsert_bitable_records_by_key(
         TABLE_ID_FINANCE_SUMMARY, sync_df,
         key_col="合同编号", key_field_name="合同编号",
+        date_cols={"下单日期"},
     )
     if err:
         return {"ok": False, "error": err}
@@ -1046,12 +1047,14 @@ def _sync_finance_detail() -> Dict[str, Any]:
 
     if to_update:
         update_df = pd.DataFrame(to_update)
-        update_bitable_records(TABLE_ID_FINANCE_DETAIL, update_df, record_id_col="_record_id")
+        update_bitable_records(TABLE_ID_FINANCE_DETAIL, update_df, record_id_col="_record_id",
+                               numeric_cols={"合同数量"})
 
     if to_create:
         create_df = pd.DataFrame(to_create)
         create_df = create_df.drop(columns=["_record_id"], errors="ignore")
-        write_df_to_bitable(TABLE_ID_FINANCE_DETAIL, create_df)
+        write_df_to_bitable(TABLE_ID_FINANCE_DETAIL, create_df,
+                            numeric_cols={"合同数量"})
 
     return {"ok": True, "synced": len(sync_rows), "updated": len(to_update), "created": len(to_create)}
 
@@ -1298,7 +1301,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 TABLE_ID_FINANCE_DETAIL,
                 existing_updates,
                 record_id_col="_record_id",
-                numeric_cols={"包干合同单采数量", "单采价格", "小计"},
+                numeric_cols={"包干合同单采数量", "小计"},
             )
 
     # 写入补行的新明细行
@@ -1338,7 +1341,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 TABLE_ID_FINANCE_SUMMARY,
                 su_to_update,
                 record_id_col="_record_id",
-                numeric_cols={"AI项目金额"},
+                numeric_cols=set(),
             )
 
     return {
