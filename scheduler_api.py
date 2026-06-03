@@ -1116,8 +1116,6 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
 
     # 新增明细行（完整性检查产生）
     new_detail_rows: List[Dict[str, Any]] = []
-    # 需要更新的总表备注
-    summary_remarks: Dict[str, str] = {}  # contract_no → new_remark
     # 费用检查结果
     summary_check: Dict[str, str] = {}  # contract_no → check_result
 
@@ -1195,10 +1193,6 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 "合同数量": rb800_total - threshold,
                 "合同类型": "包干",
             })
-            existing_remark = safe_str(summary_row.get("备注", ""))
-            new_remark = "AI巡查增加设备费用"
-            if new_remark not in existing_remark:
-                summary_remarks[contract_no] = (existing_remark + "；" + new_remark).strip("；")
             check_msgs.append(f"SPEC-RB800-KZP 合计 {rb800_total} > {threshold}，已增加设备费用行")
 
         # 汇总费用检查结果
@@ -1329,9 +1323,6 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
 
         if contract_no in summary_check:
             update_row["AI费用检查"] = summary_check[contract_no]
-
-        if contract_no in summary_remarks:
-            update_row["备注"] = summary_remarks[contract_no]
 
         if contract_no in contract_totals:
             update_row["AI项目金额"] = contract_totals[contract_no]
