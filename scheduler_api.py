@@ -142,6 +142,11 @@ app = FastAPI(docs_url=None, redoc_url=None, title="AI排单服务")
 class ScheduleRequest(BaseModel):
     trigger: str = "test"
 
+
+class FinanceCalculateRequest(BaseModel):
+    threshold: int = 3
+
+
 # =========================
 # 线程池（并行读表 + 异步上下文兼容）
 # =========================
@@ -4952,6 +4957,35 @@ async def feishu_webhook(request: Request):
         traceback.print_exc()
 
     return {"msg": "ok"}
+
+
+@app.post("/finance/sync")
+def finance_sync():
+    """同步财务对账数据：总表 ← 销售订单主表，明细表 ← 销售订单明细表 + 计费规则匹配。"""
+    try:
+        summary_result = _sync_finance_summary()
+        detail_result = _sync_finance_detail()
+
+        return {
+            "ok": summary_result.get("ok", False) and detail_result.get("ok", False),
+            "summary": summary_result,
+            "detail": detail_result,
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"同步异常: {e}"}
+
+
+@app.post("/finance/calculate")
+def finance_calculate(req: FinanceCalculateRequest):
+    """执行财务核算：完整性检查 → 包干/单采分类核算 → 汇总回写。
+
+    threshold: SPEC-RB800-KZP 设备费触发阈值，默认 3
+    """
+    try:
+        result = _run_finance_calculate(threshold=req.threshold)
+        return result
+    except Exception as e:
+        return {"ok": False, "error": f"核算异常: {e}"}
 
 
 if __name__ == "__main__":
