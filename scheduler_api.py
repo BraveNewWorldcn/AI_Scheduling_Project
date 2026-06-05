@@ -108,7 +108,8 @@ TABLE_ID_SHIPPING = os.getenv("TABLE_ID_SHIPPING", "")
 TABLE_ID_DAILY_REPORT = os.getenv("TABLE_ID_DAILY_REPORT", "")
 # 财务核算模块表 ID
 TABLE_ID_FINANCE_SUMMARY = os.getenv("TABLE_ID_FINANCE_SUMMARY", "")      # 财务对账总表
-TABLE_ID_BILLING_RULES = os.getenv("TABLE_ID_BILLING_RULES", "")          # 产品计费规则主表
+# ⚠️ 产品计费规则主表为只读数据源，绝对禁止任何形式的写入、修改、删除操作
+TABLE_ID_BILLING_RULES = os.getenv("TABLE_ID_BILLING_RULES", "")          # 产品计费规则主表（只读）
 TABLE_ID_FINANCE_DETAIL = os.getenv("TABLE_ID_FINANCE_DETAIL", "")        # 财务对账明细表
 
 # ===== 输出表字段映射 =====
@@ -731,13 +732,24 @@ def update_bitable_records(
         _post_batch(url, headers, records_batch, "更新")
 
 
+def _table_id_from_url(url: str) -> str:
+    """从飞书 API URL 中提取 table_id。"""
+    import re
+    m = re.search(r"/tables/([^/]+)/", url)
+    return m.group(1) if m else "?"
+
+
 def _post_batch(url: str, headers: Dict[str, str], records: List[Dict[str, Any]], action: str) -> bool:
     """发送一批记录到飞书批量 API。返回 True 表示成功。"""
     try:
         resp = httpx.post(url, headers=headers, json={"records": records}, timeout=60.0)
         data = _safe_http_json(resp, f"批量{action}")
         if data.get("code") != 0:
-            print(f"批量{action}失败: code={data.get('code')}, msg={data.get('msg')}")
+            print(f"批量{action}失败: table={_table_id_from_url(url)} code={data.get('code')}, msg={data.get('msg')}")
+            if records:
+                print(f"  第一条数据示例: {json.dumps(records[0], ensure_ascii=False, default=str)[:500]}")
+            # 打印完整响应
+            print(f"  完整响应: {json.dumps(data, ensure_ascii=False, default=str)[:2000]}")
             return False
         else:
             print(f"批量{action}成功: {len(records)} 条")
@@ -766,10 +778,10 @@ def upsert_bitable_records_by_key(
         err = str(e)
         if "1254004" in err or "WrongTableId" in err:
             return (
-                "读取 AI排单总表失败：飞书错误 WrongTableId(1254004)，说明 TABLE_ID_DETAIL 不是有效的多维表格 table_id。"
-                f" 当前 TABLE_ID_DETAIL={table_id!r}。详情：{err}"
+                f"读取多维表格失败：飞书错误 WrongTableId(1254004)，说明 table_id 不是有效的多维表格。"
+                f" 当前 table_id={table_id!r}。详情：{err}"
             )
-        print(f"读取 AI排单总表时出现异常，将采用直接新增方式：{err}")
+        print(f"读取多维表格时出现异常，将采用直接新增方式：{err}")
         existing = pd.DataFrame()
 
     key_to_record: Dict[str, str] = {}
@@ -907,6 +919,49 @@ def _match_spec_id(product_name: str, spec: str, billing_df: pd.DataFrame) -> st
                 val = rule.get("Spec_ID", "")
                 return str(val).strip() if pd.notna(val) else ""
 
+    # 3. 模糊匹配：同规格下，找产品名称最相似的规则
+    same_spec = billing_df[
+        billing_df["规格型号"].astype(str).str.strip() == spec_norm
+    ]
+    if not same_spec.empty:
+        # 3a. 双向子串匹配（一方包含另一方）
+        best_match = None
+        best_len = 0
+        for _, rule in same_spec.iterrows():
+            rule_name = str(rule.get("产品名称", "")).strip()
+            if not rule_name:
+                continue
+            if rule_name in product_name_norm or product_name_norm in rule_name:
+                if len(rule_name) > best_len:
+                    best_match = rule
+                    best_len = len(rule_name)
+        if best_match is not None:
+            val = best_match.get("Spec_ID", "")
+            return str(val).strip() if pd.notna(val) else ""
+
+        # 3b. Token 重叠匹配：按常见分隔符拆分，找重叠最多的规则
+        import re
+        pn_tokens = set(re.split(r'[-/—、，。\s]+', product_name_norm.lower()))
+        pn_tokens.discard('')
+        best_overlap = 0
+        best_match = None
+        for _, rule in same_spec.iterrows():
+            rule_name = str(rule.get("产品名称", "")).strip()
+            if not rule_name:
+                continue
+            rn_tokens = set(re.split(r'[-/—、，。\s]+', rule_name.lower()))
+            rn_tokens.discard('')
+            overlap = len(pn_tokens & rn_tokens)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_match = rule
+        # 至少需要 3 个 token 重叠才算匹配
+        if best_overlap >= 3 and best_match is not None:
+            val = best_match.get("Spec_ID", "")
+            return str(val).strip() if pd.notna(val) else ""
+
+    # 所有匹配策略均失败 → 产品缺少计费规则，需人工在飞书计费规则主表中补充
+    print(f"[WARNING] 计费规则未匹配: 产品={product_name_norm}, 规格={spec_norm} —— 请在产品计费规则主表中补充该产品")
     return ""
 
 
@@ -1109,10 +1164,19 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
     if "人工核对金额" in summary_df.columns and "合同编号" in summary_df.columns:
         for _, r in summary_df.iterrows():
             amt = r.get("人工核对金额")
-            if pd.notna(amt) and safe_numeric(amt) != 0:
+            if pd.notna(amt):
                 contract = safe_str(r.get("合同编号", ""))
                 if contract:
                     locked_contracts.add(contract)
+
+    # 项目类型未设置的合同（需用户先设置）
+    no_project_type_contracts: Set[str] = set()
+    if "项目类型" in summary_df.columns and "合同编号" in summary_df.columns:
+        for _, r in summary_df.iterrows():
+            cno = safe_str(r.get("合同编号", ""))
+            pt = safe_str(r.get("项目类型", ""))
+            if cno and not pt and cno not in locked_contracts:
+                no_project_type_contracts.add(cno)
 
     # 新增明细行（完整性检查产生）
     new_detail_rows: List[Dict[str, Any]] = []
@@ -1148,6 +1212,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
             for _, r in contract_detail.iterrows()
         )
         if not has_service_fee:
+            svc_spec_id = _match_spec_id("消防远程控制服务费", "定制", billing_df)
             new_detail_rows.append({
                 "合同编号": contract_no,
                 "项目名称": safe_str(summary_row.get("项目名称", "")),
@@ -1155,6 +1220,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 "规格": "定制",
                 "合同数量": 1,
                 "合同类型": "包干",
+                "Spec_ID": svc_spec_id,
             })
             check_msgs.append("缺少「消防远程控制服务费」，已自动补行")
 
@@ -1164,6 +1230,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
             for _, r in contract_detail.iterrows()
         )
         if not has_package_fee:
+            pkg_spec_id = _match_spec_id("消防远程控制包干费", "定制", billing_df)
             new_detail_rows.append({
                 "合同编号": contract_no,
                 "项目名称": safe_str(summary_row.get("项目名称", "")),
@@ -1171,6 +1238,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 "规格": "定制",
                 "合同数量": 1,
                 "合同类型": "包干",
+                "Spec_ID": pkg_spec_id,
             })
             check_msgs.append("缺少「消防远程控制包干费」，已自动补行")
 
@@ -1185,6 +1253,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 rb800_total += safe_numeric(nr.get("合同数量", 0))
 
         if rb800_total > threshold:
+            eqp_spec_id = _match_spec_id("消防远程控制设备费", "SPEC-EQP", billing_df)
             new_detail_rows.append({
                 "合同编号": contract_no,
                 "项目名称": safe_str(summary_row.get("项目名称", "")),
@@ -1192,8 +1261,9 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 "规格": "SPEC-EQP",
                 "合同数量": rb800_total - threshold,
                 "合同类型": "包干",
+                "Spec_ID": eqp_spec_id,
             })
-            check_msgs.append(f"SPEC-RB800-KZP 合计 {rb800_total} > {threshold}，已增加设备费用行")
+            check_msgs.append(f"SPEC-RB800-KZP 合计 {rb800_total} > {threshold}，AI已自动填充遗漏费用")
 
         # 汇总费用检查结果
         if check_msgs:
@@ -1232,12 +1302,23 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
         if contract_no in locked_contracts:
             continue
 
+        if contract_no in no_project_type_contracts:
+            continue
+
         sum_row = summary_index.get(contract_no)
         if sum_row is None:
             continue
 
         project_type = safe_str(sum_row.get("项目类型", ""))
-        rule = billing_index.get(spec_id, {})
+
+        # 产品未匹配计费规则 → 跳过核算，保留明细表已有价格数据，禁止写 0
+        if not spec_id or spec_id not in billing_index:
+            product_name = safe_str(detail_row.get("产品名称", ""))
+            spec = safe_str(detail_row.get("规格", ""))
+            print(f"[WARNING] 跳过核算（缺计费规则）: 合同={contract_no}, 产品={product_name}, 规格={spec}, Spec_ID={spec_id}")
+            continue
+
+        rule = billing_index[spec_id]
 
         is_baogan = "否"
         single_qty = 0
@@ -1255,22 +1336,26 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
             billing_method = rule.get("计费方式", "")
             baogan_threshold = safe_numeric(rule.get("包干阈值", 0))
 
-            if billing_method == "单采" and baogan_threshold == 0:
+            if billing_method == "单采":
                 # 单采设备
                 unit_price = safe_numeric(rule.get("单采单价", 0))
                 single_qty = qty
                 subtotal = qty * unit_price
                 is_baogan = "否"
+            elif billing_method == "完全包干" or baogan_threshold == 0:
+                # 完全包干（或无阈值）：全部在包干范围内
+                is_baogan = "是"
+                single_qty = 0
+                unit_price = 0.0
+                subtotal = 0.0
             else:
-                # 包干产品
+                # 限制包干：阈值内免费，超出部分按单采计算
                 is_baogan = "是"
                 if qty <= baogan_threshold:
-                    # 阈值内：价格为0
                     unit_price = 0.0
                     single_qty = 0
                     subtotal = 0.0
                 else:
-                    # 阈值外
                     single_qty = qty - baogan_threshold
                     unit_price = safe_numeric(rule.get("单采单价", 0))
                     subtotal = single_qty * unit_price
@@ -1296,30 +1381,47 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
         # 只更新已有 record_id 的行
         existing_updates = update_df[update_df["_record_id"] != ""]
         if not existing_updates.empty:
+            detail_write = existing_updates.drop(columns=["合同编号"], errors="ignore")
             update_bitable_records(
                 TABLE_ID_FINANCE_DETAIL,
-                existing_updates,
+                detail_write,
                 record_id_col="_record_id",
                 numeric_cols={"包干合同单采数量", "小计"},
             )
 
-    # 写入补行的新明细行
+        # 将新行的核算结果合并到 new_detail_rows
+        new_calc = update_df[update_df["_record_id"] == ""]
+        if not new_calc.empty and new_detail_rows:
+            calc_lookup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for _, cr in new_calc.iterrows():
+                key = (safe_str(cr.get("合同编号", "")), safe_str(cr.get("产品名称", "")))
+                calc_lookup[key] = cr
+            for nr in new_detail_rows:
+                key = (safe_str(nr.get("合同编号", "")), safe_str(nr.get("产品名称", "")))
+                if key in calc_lookup:
+                    cr = calc_lookup[key]
+                    nr["是否计入包干"] = safe_str(cr.get("是否计入包干", ""))
+                    nr["包干合同单采数量"] = safe_numeric(cr.get("包干合同单采数量", 0))
+                    nr["单采价格"] = safe_numeric(cr.get("单采价格", 0))
+                    nr["小计"] = safe_numeric(cr.get("小计", 0))
+
+    # 写入补行的新明细行（含核算结果）
     if new_detail_rows:
         new_detail_df = pd.DataFrame(new_detail_rows)
         write_df_to_bitable(
             TABLE_ID_FINANCE_DETAIL,
             new_detail_df,
-            numeric_cols={"合同数量"},
+            numeric_cols={"合同数量", "包干合同单采数量", "小计"},
         )
 
-    # ========== 步骤5: 回写总表（AI费用检查 + AI项目金额 + 备注）==========
+    # ========== 步骤5: 回写总表（AI费用检查 + AI项目金额）==========
     summary_update_rows: List[Dict[str, Any]] = []
     for _, r in summary_df.iterrows():
         contract_no = safe_str(r.get("合同编号", ""))
         if contract_no in locked_contracts:
             continue
 
-        update_row = {"_record_id": r.get("_record_id", ""), "合同编号": contract_no}
+        update_row = {"_record_id": r.get("_record_id", "")}
 
         if contract_no in summary_check:
             update_row["AI费用检查"] = summary_check[contract_no]
@@ -1343,6 +1445,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
     return {
         "ok": True,
         "locked_contracts": len(locked_contracts),
+        "no_project_type_contracts": len(no_project_type_contracts),
         "new_detail_rows": len(new_detail_rows),
         "calculated_rows": len(calc_results),
         "contracts_updated": len(summary_update_rows),
