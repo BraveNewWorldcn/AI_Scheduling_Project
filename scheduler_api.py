@@ -1071,7 +1071,7 @@ def _sync_finance_detail() -> Dict[str, Any]:
     to_update: List[Dict[str, Any]] = []
     to_create: List[Dict[str, Any]] = []
 
-    preserve_detail_cols = ["是否计入包干", "包干合同单采数量", "单采价格", "小计"]
+    preserve_detail_cols = ["是否计入包干", "包干合同单采数量", "单采价格", "小计", "Spec_ID", "合同类型"]
     for _, row in sync_df.iterrows():
         key = (
             safe_str(row.get("合同编号", "")),
@@ -1253,17 +1253,23 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 rb800_total += safe_numeric(nr.get("合同数量", 0))
 
         if rb800_total > threshold:
-            eqp_spec_id = _match_spec_id("消防远程控制设备费", "SPEC-EQP", billing_df)
-            new_detail_rows.append({
-                "合同编号": contract_no,
-                "项目名称": safe_str(summary_row.get("项目名称", "")),
-                "产品名称": "消防远程控制设备费",
-                "规格": "SPEC-EQP",
-                "合同数量": rb800_total - threshold,
-                "合同类型": "包干",
-                "Spec_ID": eqp_spec_id,
-            })
-            check_msgs.append(f"SPEC-RB800-KZP 合计 {rb800_total} > {threshold}，AI已自动填充遗漏费用")
+            # 检查合同已是否存在设备费行，避免重复添加
+            has_equipment_fee = any(
+                safe_str(r.get("产品名称", "")) == "消防远程控制设备费"
+                for _, r in contract_detail.iterrows()
+            )
+            if not has_equipment_fee:
+                eqp_spec_id = _match_spec_id("消防远程控制设备费", "SPEC-EQP", billing_df)
+                new_detail_rows.append({
+                    "合同编号": contract_no,
+                    "项目名称": safe_str(summary_row.get("项目名称", "")),
+                    "产品名称": "消防远程控制设备费",
+                    "规格": "SPEC-EQP",
+                    "合同数量": rb800_total - threshold,
+                    "合同类型": "包干",
+                    "Spec_ID": eqp_spec_id,
+                })
+                check_msgs.append(f"SPEC-RB800-KZP 合计 {rb800_total} > {threshold}，设备费用已补充")
 
         # 汇总费用检查结果
         if check_msgs:
