@@ -357,6 +357,14 @@ def build_inventory_index(inv: pd.DataFrame):
     if inv is None or inv.empty:
         return
 
+    # 按 SKU 聚合：合并同一SKU多批次库存，避免取max单行而低估总库存
+    if "SKU" in inv.columns and "库存数量" in inv.columns:
+        agg_map = {"库存数量": "sum"}
+        for col in ["国网设备型号", "国网设备名称", "设备型号", "设备名称"]:
+            if col in inv.columns:
+                agg_map[col] = lambda x: next((str(v).strip() for v in x.dropna() if str(v).strip()), "")
+        inv = inv.groupby("SKU", as_index=False).agg(agg_map)
+
     inv_records = inv.to_dict(orient="records")
 
     for rec in inv_records:
@@ -1622,6 +1630,12 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
 
         summary_update_rows.append(update_row)
 
+    # 回写前校验：确保汇总行数与预期一致
+    expected_summary = len([c for c in contract_totals if c not in locked_contracts])
+    if len(summary_update_rows) != expected_summary:
+        print(f"[ERROR] 核算回写校验失败: 预期 {expected_summary} 合同, 实际 {len(summary_update_rows)}")
+        return {"ok": False, "error": f"总表回写校验失败: 预期{expected_summary}合同, 实际{len(summary_update_rows)}"}
+
     if summary_update_rows:
         su_df = pd.DataFrame(summary_update_rows)
         su_to_update = su_df[su_df["_record_id"] != ""]
@@ -2082,42 +2096,29 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
         order_qty = to_num(row.get("订单总数量", 0))
         contract_id = safe_str(row.get("合同编号", ""))
 
-        # 路径压缩：跳过所有已满日期（防死循环：最多检查 365 天）
+        # 路径压缩 + 容量检查：找到第一个有容量的工作日（防死循环：最多 365 天）
         d = base_date
-        visited: List[date] = []
         _safety = 0
-        while d in overflow and _safety < 365:
-            visited.append(d)
-            d = overflow[d]
-            _safety += 1
-        # 路径压缩：visited 中的所有日期直接指向 d
-        for v in visited:
-            overflow[v] = d
+        while _safety < 365:
+            visited: List[date] = []
+            while d in overflow:
+                visited.append(d)
+                d = overflow[d]
+            for v in visited:
+                overflow[v] = d
 
-        # 检查 d 是否真的还有容量
-        c = day_count.get(d, 0)
-        sk = day_sku_kinds.get(d, 0)
-        tq = day_total_qty.get(d, 0)
-        cap = calc_daily_capacity(sk, tq, base=5)
-
-        if c >= cap:
-            next_d = next_working_day(d + timedelta(days=1))
-            overflow[d] = next_d
-            # 继续找下一个空闲日
-            d = next_d
             c = day_count.get(d, 0)
             sk = day_sku_kinds.get(d, 0)
             tq = day_total_qty.get(d, 0)
             cap = calc_daily_capacity(sk, tq, base=5)
-            # 最多再检查一次；如果连续满则走压缩路径（防死循环）
-            _safety2 = 0
-            while d in overflow and _safety2 < 365:
-                d = overflow[d]
-                _safety2 += 1
-                c = day_count.get(d, 0)
-                sk = day_sku_kinds.get(d, 0)
-                tq = day_total_qty.get(d, 0)
-                cap = calc_daily_capacity(sk, tq, base=5)
+
+            if c < cap:
+                break
+
+            next_d = next_working_day(d + timedelta(days=1))
+            overflow[d] = next_d
+            d = next_d
+            _safety += 1
 
         # 分配到 d
         day_count[d] = c + 1
