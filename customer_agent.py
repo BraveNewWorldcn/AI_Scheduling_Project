@@ -58,10 +58,13 @@ TABLE_ID_DETAIL = os.getenv("TABLE_ID_DETAIL", "tbl09Z6C7wCGh3mW")
 if not APP_SECRET:
     sys.exit("[X] 请先设置 CUSTOMER_BOT_APP_SECRET")
 
+from collections import deque
+
 # ===== 会话缓存（消歧卡片选择） =====
 # {open_id: [{"合同编号":..., "项目名称":...}, ...]}
-_session_cache: Dict[str, List[Dict[str, str]]] = {}
-_seen_event_ids: set[str] = set()
+# 5分钟 TTL，防止用户不回复导致内存泄漏
+_session_cache: Dict[str, tuple[float, List[Dict[str, str]]]] = {}
+_seen_event_ids: deque = deque(maxlen=5000)
 _token_cache: Dict[str, tuple[str, datetime]] = {}
 _lark_cli_path: str = ""
 
@@ -332,9 +335,9 @@ def _fuzzy_match_orders(orders: List[Dict[str, str]], user_input: str) -> List[D
 
 def _build_disambiguation_card(candidates: List[Dict[str, Any]], open_id: str) -> dict:
     # 缓存候选订单，供用户回复序号时查询
-    _session_cache[open_id] = [
+    _session_cache[open_id] = (time.time(), [
         {"合同编号": c["合同编号"], "项目名称": c["项目名称"]} for c in candidates[:9]
-    ]
+    ])
 
     lines = [f"🧐 帮您找到了 **{len(candidates)}** 个相关项目：\n"]
     for i, c in enumerate(candidates[:9]):
@@ -572,7 +575,7 @@ def process_message(open_id: str, user_input: str) -> dict:
 
     # 检查是否在消歧会话中（用户回复了序号）
     if open_id in _session_cache:
-        candidates = _session_cache.pop(open_id)
+        _, candidates = _session_cache.pop(open_id)
         try:
             idx = int(user_input.strip()) - 1
             if 0 <= idx < len(candidates):

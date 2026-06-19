@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, date, timezone
 import json
 from typing import Any, Dict, List, Optional, Tuple, Set, TYPE_CHECKING
 from collections import defaultdict
+import openpyxl
 
 # 懒加载 pandas（Windows 上 import pandas 需 3-5 秒，推迟到首次调用 API 时加载）
 if TYPE_CHECKING:
@@ -4244,6 +4245,60 @@ def daily_report():
         return {"error": str(e)}
     except Exception as e:
         return {"error": f"日报获取失败: {e}"}
+
+
+@app.get("/schedule/shortage-export")
+def shortage_export():
+    """导出缺货工单 Excel：按优先级排序，分「订单缺货」和「常规补货」两区。"""
+    try:
+        from io import BytesIO
+        from fastapi.responses import StreamingResponse
+
+        summary = fetch_bitable_to_df(TABLE_ID_DETAIL)
+        if summary.empty:
+            return {"error": "AI排单总表无数据"}
+
+        # 过滤缺货合同
+        shortage = summary[summary["发货状态"].isin(["部分可发", "等待中"])].copy()
+        if shortage.empty:
+            return {"error": "当前无缺货订单"}
+
+        # 优先级排序：紧急(0) > 换货(1) > 补发(2) > 维修(3) > 常规(4)
+        def _priority(r):
+            for tag, p in [("紧急", 0), ("换货", 1), ("补发", 2), ("维修", 3)]:
+                if tag in safe_str(r.get("项目类型", "")):
+                    return p
+            return 4
+        shortage["__p"] = shortage.apply(_priority, axis=1)
+        shortage = shortage.sort_values(["__p", "合同编号"])
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "缺货工单"
+        ws.append(["序号", "合同编号", "项目名称", "产品", "规格", "缺货数量", "入库日期"])
+
+        # 订单缺货区
+        ws.append(["▎ 订单缺货"])
+        for idx, (_, r) in enumerate(shortage.iterrows(), 1):
+            ws.append([
+                idx,
+                safe_str(r.get("合同编号", "")),
+                safe_str(r.get("项目名称", "")),
+                "", "",  # 产品/规格需从明细表取，此处留空由用户补充
+                safe_str(r.get("缺货SKU数", "")),
+                "",  # 入库日期留空
+            ])
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=shortage.xlsx"}
+        )
+    except Exception as e:
+        return {"error": f"导出失败: {e}"}
 
 
 # =========================

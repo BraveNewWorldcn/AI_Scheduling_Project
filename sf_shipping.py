@@ -377,7 +377,7 @@ def _feishu_update_shipping_table(project_name: str, tracking_number: str, info:
                 "conjunction": "and",
                 "conditions": [{"field_name": "项目名称", "operator": "contains", "value": [project_name]}]
             },
-            "page_size": 5,
+            "page_size": 500,
         }, timeout=15.0)
 
         data = resp.json()
