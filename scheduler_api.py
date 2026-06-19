@@ -1645,7 +1645,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
         summary_update_rows.append(update_row)
 
     # 回写前校验：确保汇总行数与预期一致（非锁定合同数）
-    expected_summary = len([c for _, r in summary_df.iterrows()
+    expected_summary = len([1 for _, r in summary_df.iterrows()
                            if safe_str(r.get("合同编号", "")) not in locked_contracts])
     if len(summary_update_rows) != expected_summary:
         print(f"[ERROR] 核算回写校验失败: 预期 {expected_summary} 合同, 实际 {len(summary_update_rows)}")
