@@ -902,7 +902,7 @@ def _sync_finance_summary() -> Dict[str, Any]:
     except Exception:
         existing_df = pd.DataFrame()
 
-    preserve_cols = ["项目类型", "备注", "AI项目金额", "人工核对金额", "AI费用检查"]
+    preserve_cols = ["项目类型", "备注", "AI项目金额", "人工核对金额", "AI费用检查", "同步状态"]
     if not existing_df.empty and "合同编号" in existing_df.columns:
         # 按合同编号合并，保留已有的人工字段值
         existing_preserve = existing_df[["合同编号"] + [c for c in preserve_cols if c in existing_df.columns]]
@@ -913,6 +913,19 @@ def _sync_finance_summary() -> Dict[str, Any]:
             if exist_col in sync_df.columns:
                 sync_df[col] = sync_df[exist_col].fillna("")
                 sync_df.drop(columns=[exist_col], inplace=True)
+
+    # 过滤：已锁定或已同步的合同跳过，只同步新合同和待重新同步的合同
+    before = len(sync_df)
+    sync_df = sync_df[sync_df.apply(lambda r: (
+        safe_str(r.get("人工核对金额", "")) == "" and
+        safe_str(r.get("同步状态", "")) != "已同步"
+    ), axis=1)]
+    print(f"[Finance Sync Summary] {before} → {len(sync_df)} (跳过已锁定/已同步)")
+    if sync_df.empty:
+        return {"ok": True, "synced": 0, "skipped": before}
+
+    # 标记本次同步的合同为"已同步"
+    sync_df["同步状态"] = "已同步"
 
     err = upsert_bitable_records_by_key(
         TABLE_ID_FINANCE_SUMMARY, sync_df,
@@ -1660,6 +1673,8 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
 # =========================
 # 数据缓存（避免每次请求重复读取飞书）
 # =========================
+import threading as _threading
+data_cache_lock = _threading.Lock()
 data_cache = {
     "items": None,
     "sku": None,
@@ -1676,9 +1691,10 @@ def load_data():
     try:
         items_df, sku_df, inv_df = load_feishu_data()
 
-        data_cache["items"] = items_df
-        data_cache["sku"] = sku_df
-        data_cache["inv"] = inv_df
+        with data_cache_lock:
+            data_cache["items"] = items_df
+            data_cache["sku"] = sku_df
+            data_cache["inv"] = inv_df
 
         # ===== 验证表字段完整性 =====
         print("\n【表字段验证】")
@@ -2078,7 +2094,7 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
 
     normal = df[~df["__locked"] & ~df["__special"]].copy()
     others = df[df["__locked"] | df["__special"]].copy()
-    normal = normal.sort_values(by=["__ship_date", "合同编号"], kind="stable")
+    normal = normal.sort_values(by=["__ship_date", "合同编号"], kind="stable", na_position="last")
 
     # 每个日期的已排单数 / SKU种类累加 / 数量累加
     day_count: Dict[date, int] = {}
@@ -2153,7 +2169,7 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
             lambda x: date_to_yyyy_mm_dd(next_working_day(parse_date_to_date(x) or today))
         )
     if "AI建议发货时间" in out.columns:
-        out = out.sort_values(by=["AI建议发货时间", "合同编号"], kind="stable")
+        out = out.sort_values(by=["AI建议发货时间", "合同编号"], kind="stable", na_position="last")
 
     return out, delayed
 
@@ -3445,7 +3461,7 @@ def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: di
             )
             upcoming = summary[
                 ship_col.notna() & (ship_col >= today_date) & (ship_col <= next_3d)
-            ].sort_values(by=["发货日期"], kind="stable")
+            ].sort_values(by=["发货日期"], kind="stable", na_position="last")
 
             if not upcoming.empty:
                 lines.append("")
@@ -3591,7 +3607,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
     # 按 下单时间 → 合同编号 排序，早下单的优先占用库存
     if "下单时间" in items.columns:
-        items = items.sort_values(by=["下单时间", "合同编号"], kind="stable")
+        items = items.sort_values(by=["下单时间", "合同编号"], kind="stable", na_position="last")
     else:
         items = items.sort_values(by=["合同编号"], kind="stable")
 
