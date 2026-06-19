@@ -2081,9 +2081,9 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
         return summary, 0
 
     df = summary.copy()
-    # 从产能调度中排除"等待中"的合同
+    # 从产能调度中排除"待补货"的合同
     if "整体状态" in df.columns:
-        df = df[df["整体状态"] != "等待中"]
+        df = df[df["整体状态"] == "全部可发"]
     # 只做一次日期解析，后续用 date 对象比较
     df["__ship_date"] = df["AI建议发货时间"].apply(lambda x: next_working_day(parse_date_to_date(x) or today))
 
@@ -3910,11 +3910,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                     # 尝试从原始标识获取显示名（SKU为空时直接用产品名）
                     shortage_sku_names.append(canon_shortage.get(sku_code, sku_code))
             shortage_sku_count = len(shortage_sku_codes)
-            overall_status = (
-                "全部可发" if shortage_sku_count == 0 else
-                "部分可发" if shortage_sku_count < (sku_count or 1) else
-                "等待中"
-            )
+            overall_status = "全部可发" if shortage_sku_count == 0 else "待补货"
 
             # 保护人工确认字段：如果旧记录已人工确认，保留原值
             old_confirmed = "否"
@@ -3937,7 +3933,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 "缺货SKU列表": ', '.join(shortage_sku_names),
                 "整体状态": overall_status,
                 "AI建议发货时间": (
-                    "" if shortage_sku_count >= (sku_count or 1)
+                    "" if shortage_sku_count > 0
                     else date_to_yyyy_mm_dd(next_working_day(ship_date)) if ship_date else ""
                 ),
                 "AI风险": "",
@@ -4258,7 +4254,7 @@ def shortage_export():
             return {"error": "AI排单总表无数据"}
 
         # 过滤缺货合同
-        shortage = summary[summary["整体状态"].isin(["部分可发", "等待中"])].copy()
+        shortage = summary[summary["整体状态"] == "待补货"].copy()
         if shortage.empty:
             return {"error": "当前无缺货订单"}
 
