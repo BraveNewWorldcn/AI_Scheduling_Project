@@ -2050,6 +2050,9 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
         return summary, 0
 
     df = summary.copy()
+    # 从产能调度中排除"等待中"的合同
+    if "发货状态" in df.columns:
+        df = df[df["发货状态"] != "等待中"]
     # 只做一次日期解析，后续用 date 对象比较
     df["__ship_date"] = df["AI建议发货时间"].apply(lambda x: next_working_day(parse_date_to_date(x) or today))
 
@@ -3911,7 +3914,15 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 "缺货SKU数": int(shortage_sku_count),
                 "缺货SKU列表": ', '.join(shortage_sku_names),
                 "整体状态": overall_status,
-                "AI建议发货时间": date_to_yyyy_mm_dd(next_working_day(ship_date)) if ship_date else "",
+                "发货状态": (
+                    "全部可发" if shortage_sku_count == 0 else
+                    "部分可发" if shortage_sku_count < (sku_count or 1) else
+                    "等待中"
+                ),
+                "AI建议发货时间": (
+                    "" if shortage_sku_count >= (sku_count or 1)
+                    else date_to_yyyy_mm_dd(next_working_day(ship_date)) if ship_date else ""
+                ),
                 "AI风险": "",
                 "AI建议": "",
                 "排单批次号": batch_id,
