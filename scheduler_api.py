@@ -1644,8 +1644,9 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
 
         summary_update_rows.append(update_row)
 
-    # 回写前校验：确保汇总行数与预期一致
-    expected_summary = len([c for c in contract_totals if c not in locked_contracts])
+    # 回写前校验：确保汇总行数与预期一致（非锁定合同数）
+    expected_summary = len([c for _, r in summary_df.iterrows()
+                           if safe_str(r.get("合同编号", "")) not in locked_contracts])
     if len(summary_update_rows) != expected_summary:
         print(f"[ERROR] 核算回写校验失败: 预期 {expected_summary} 合同, 实际 {len(summary_update_rows)}")
         return {"ok": False, "error": f"总表回写校验失败: 预期{expected_summary}合同, 实际{len(summary_update_rows)}"}
@@ -2081,7 +2082,7 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
         return summary, 0
 
     df = summary.copy()
-    # 从产能调度中排除"待补货"的合同
+    # 从产能调度中排除非全部可发的合同（兼容旧版"缺货"状态）
     if "整体状态" in df.columns:
         df = df[df["整体状态"] == "全部可发"]
     # 只做一次日期解析，后续用 date 对象比较
@@ -4254,7 +4255,7 @@ def shortage_export():
             return {"error": "AI排单总表无数据"}
 
         # 过滤缺货合同
-        shortage = summary[summary["整体状态"] == "待补货"].copy()
+        shortage = summary[summary["整体状态"].isin(["待补货", "缺货"])].copy()
         if shortage.empty:
             return {"error": "当前无缺货订单"}
 
