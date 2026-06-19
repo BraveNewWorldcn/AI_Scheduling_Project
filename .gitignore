@@ -1,3 +1,23 @@
 .env
 .env.local
 *.key
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.bak*
+
+# Local cache & logs
+cache/
+.server.err
+.server.log
+server.err
+server.log
+*.db
+
+# IDE & OS
+.workbuddy/
+.DS_Store
+Thumbs.db

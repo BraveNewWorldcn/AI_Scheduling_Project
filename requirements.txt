@@ -6,3 +6,6 @@ lark-oapi==1.2.10
 httpx==0.25.2
 apscheduler==3.10.4
 python-multipart==0.0.6
+openai>=1.0.0
+python-dotenv>=1.0.0
+openpyxl>=3.1.0
