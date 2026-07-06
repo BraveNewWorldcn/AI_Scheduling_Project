@@ -922,9 +922,11 @@ def _build_procurement_card(report: Dict[str, str]) -> dict:
     latest_ship_date = _shortage_latest_ship_date(report, shortage_item)
     sla_countdown = _sla_countdown_text(latest_ship_date)
     days_left = _sla_days_left(latest_ship_date)
-    sla_display = (
+    sla_level = (
         f"<font color='red'>**{sla_countdown}**</font>"
         if days_left is not None and days_left < 3
+        else f"<font color='orange'>**{sla_countdown}**</font>"
+        if days_left is not None and days_left < 7
         else f"**{sla_countdown}**"
     )
     shortage_level = "高" if shortage_sku > 0 else "中"
@@ -932,53 +934,98 @@ def _build_procurement_card(report: Dict[str, str]) -> dict:
     owner = _procurement_owner_mention()
     action_url = os.getenv("PROCUREMENT_ACTION_URL", "")
 
-    pressure_summary = (
-        f"{owner} 发现 <font color='red'>**{shortage_sku} 项物料处于断供状态**</font>，"
-        "将直接威胁下周交付，请立即介入供应商交期、调拨和替代料闭环。"
+    # ---- 三格仪表盘 ----
+    dash_columns = [
+        {
+            "tag": "column",
+            "width": "weighted", "weight": 1,
+            "elements": [{"tag": "markdown", "content": f"<font color='red'>**{shortage_sku}**</font>\n断供物料", "text_align": "center"}],
+        },
+        {
+            "tag": "column",
+            "width": "weighted", "weight": 1,
+            "elements": [{"tag": "markdown", "content": f"<font color='red'>**{_format_short_date(latest_ship_date)}**</font>\nSLA截止", "text_align": "center"}],
+        },
+        {
+            "tag": "column",
+            "width": "weighted", "weight": 1,
+            "elements": [{"tag": "markdown", "content": f"<text_tag color='red'>高风险</text_tag>\n等级", "text_align": "center"}],
+        },
+    ]
+
+    # ---- 最紧急物料 ----
+    spotlight = (
+        f"{owner}\n\n"
+        f"**<font color='red'>最紧急物料</font>**：{top_sku}\n"
+        f"业务影响：{business_impact}\n"
+        f"SLA倒计时：{sla_level}（最晚{_format_short_date(latest_ship_date)}）"
     )
-    material_spotlight = (
-        "🧨 **最紧急物料特写**\n"
-        f"**断供物料**：<font color='red'>**{top_sku}**</font>\n"
-        f"**💥 爆炸半径**：<font color='red'>**{business_impact}**</font>\n"
-        f"**⏳ SLA 倒计时**：{sla_display}（最晚发货日：{_format_short_date(latest_ship_date)}）"
-    )
-    backup_markdown = (
-        "📋 **备用清单与动作**\n"
-        f"{backup_list}\n\n"
-        "**动作要求**：今天内更新交期；若无法承诺到货，请同步替代料/拆单方案。"
-    )
+
+    # ---- Top 5 其他物料 ----
+    other_items = _load_shortage_items(report)
+    other_lines = []
+    count = 0
+    for item in other_items:
+        sku = _shortage_item_sku(item)
+        if not sku or sku.strip() == top_sku.strip():
+            continue
+        gap = _shortage_item_gap(item)
+        impact = _shortage_business_impact(report, item)
+        other_lines.append(f"{sku}(缺{gap}) | {impact}")
+        count += 1
+        if count >= 5:
+            break
+    if len(other_items) > count + 1:
+        other_lines.append(f"+{len(other_items) - count - 1} 项详见清单")
+
+    # ---- 组装 card ----
+    elements = [
+        {"tag": "column_set", "flex_mode": "trisect", "columns": dash_columns},
+        {"tag": "hr"},
+        {"tag": "markdown", "content": spotlight},
+    ]
+    if other_lines:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "**其他高风险物料**\n" + "\n".join(other_lines)})
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": "<text_tag color='orange'>今日需完成</text_tag>\n- 更新承诺到货交期\n- 无法承诺则同步替代料/拆单方案"})
+
+    # 按钮
+    buttons = [{
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "录入最新到货交期"},
+        "type": "primary",
+        "url": action_url,
+        "multi_url": {"url": action_url, "pc_url": action_url, "android_url": action_url, "ios_url": action_url}
+    }] if action_url else []
+    # secondary button: 查物料清单
+    inv_url = os.getenv("BITABLE_INV_URL", "")
+    if inv_url:
+        buttons.append({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "查看紧缺物料清单"},
+            "type": "default",
+            "url": inv_url,
+            "multi_url": {"url": inv_url, "pc_url": inv_url, "android_url": inv_url, "ios_url": inv_url}
+        })
+    if buttons:
+        elements.append({"tag": "action", "actions": buttons})
+
+    # note 时间戳
+    now_ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M CST")
+    elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"批次 {batch} | {now_ts}"}]})
 
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
             "template": "red" if shortage_sku > 0 else "orange",
             "title": {
-                "content": f"🚨 核心物料断供阻断预警！(级别：{shortage_level})",
+                "content": f"物料断供阻断预警 ({batch})",
                 "tag": "plain_text"
             }
         },
-        "elements": [
-            {"tag": "markdown", "content": pressure_summary},
-            {"tag": "hr"},
-            {"tag": "markdown", "content": material_spotlight},
-            {"tag": "hr"},
-            {"tag": "markdown", "content": backup_markdown}
-        ]
+        "elements": elements
     }
-
-    if action_url:
-        card["elements"].append({
-            "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "📝 录入最新到货交期"},
-                "type": "primary",
-                "url": action_url,
-                "multi_url": {"url": action_url, "pc_url": action_url,
-                              "android_url": action_url, "ios_url": action_url}
-            }]
-        })
-
     return card
 
 
@@ -990,31 +1037,21 @@ def _build_planner_card(report: Dict[str, str]) -> dict:
     action_url = os.getenv("PLANNER_ACTION_URL", "")
 
     markdown = (
-        f"🤖 AI 影子计算已完成，请排单员进行人类智力兜底与放行。\n\n"
+        "AI 影子计算已完成，请排单员进行人工确认。\n\n"
         f"已排单：**{scheduled}** 单\n"
         f"未排单：**{unscheduled}** 单"
     )
 
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "template": "blue",
-            "title": {
-                "content": f"🏭 排单确认通知 (批次: {batch})",
-                "tag": "plain_text"
-            }
-        },
-        "elements": [
-            {"tag": "markdown", "content": markdown}
-        ]
-    }
+    elements = [
+        {"tag": "markdown", "content": markdown}
+    ]
 
     if action_url:
-        card["elements"].append({
+        elements.append({
             "tag": "action",
             "actions": [{
                 "tag": "button",
-                "text": {"tag": "plain_text", "content": "🏭 确认排期，一键同步生产"},
+                "text": {"tag": "plain_text", "content": "确认排期，一键同步生产"},
                 "type": "primary",
                 "url": action_url,
                 "multi_url": {"url": action_url, "pc_url": action_url,
@@ -1022,6 +1059,21 @@ def _build_planner_card(report: Dict[str, str]) -> dict:
             }]
         })
 
+    # note 时间戳
+    now_ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M CST")
+    elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": f"批次 {batch} | {now_ts}"}]})
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {
+                "content": f"排单确认通知 ({batch})",
+                "tag": "plain_text"
+            }
+        },
+        "elements": elements
+    }
     return card
 
 
@@ -1045,70 +1097,138 @@ def _build_boss_card(report: Dict[str, str]) -> dict:
     cs = _safe_int(can_ship)
     delivery_rate = _format_pct(cs, ss)
     d_int = _safe_int(delay)
-    future_short_int = _safe_int(future_short)
 
-    insight = _boss_ai_insight(report, color, lead_time, hunger_days)
-    insight_markdown = (
-        "🧠 **AI 经营洞察**\n"
-        f"{insight}"
-    )
-    asset_markdown = (
-        "📦 **履约与资产盘面**\n"
-        f"**本周平均履约周期 (Lead Time)**：**{lead_time} 天**\n"
-        f"**产能池饥饿度**：当前积压订单仅够维持流转 **{hunger_days} 天**\n"
-        f"**今日履约效率**：可发 **{can_ship}/{should_ship}** 单，交付率 **{delivery_rate}**"
-    )
-    risk_markdown = ""
-    if _safe_int(shortage_sku) > 0 or d_int > 0 or future_short_int > 0:
-        blocked = max(d_int, future_short_int)
-        risk_markdown = (
-            "⚠️ **风险阻断区**\n"
-            f"当前有 <font color='red'>**{shortage_sku} 个核心物料断供**</font>，"
-            f"阻断 **{blocked}** 个重点交付窗口；最紧缺为 "
-            f"<font color='red'>**{top_sku}**</font>。"
-        )
-    footer_markdown = (
-        f"订单资产池：**{total}** 单。"
-        "请重点关注断供物料闭环与新增订单水位，不在老板群展开明细。"
-    )
+    # ---- MVP: 三格仪表盘 (column_set trisect) ----
+    # 交付率（含目标对比）、库存健康度（含目标对比）、需关注风险项
+    dr_target = float(os.getenv("KPI_DELIVERY_TARGET", "90"))
+    dr_ok = cs > 0 and ss > 0 and (float(cs)/float(ss) * 100) >= dr_target
 
-    elements = [
-        {"tag": "markdown", "content": insight_markdown},
-        {"tag": "hr"},
-        {"tag": "markdown", "content": asset_markdown},
+    sufficient_sku = _safe_int(report.get("库存充足SKU数", "0"))
+    warning_sku = _safe_int(report.get("库存预警SKU数", "0"))
+    total_sku = _safe_int(report.get("SKU总数", "0"))
+    health_rate = _format_pct(sufficient_sku, total_sku)
+    health_target = float(os.getenv("KPI_HEALTH_TARGET", "80"))
+    health_ok = total_sku > 0 and (sufficient_sku / total_sku * 100) >= health_target
+
+    # 需关注项数：延迟 + 缺货 + 预警
+    attention_count = d_int + warning_sku + (1 if _safe_int(shortage_sku) > 0 and top_sku != "无" else 0)
+    attention_ok = attention_count <= 2
+
+    # 双通道编码：颜色 + 文字标签
+    dr_pct = (float(cs) / float(ss) * 100) if ss > 0 else 0
+    dr_label = "<text_tag color='green'>正常</text_tag>" if dr_ok else ("<text_tag color='orange'>关注</text_tag>" if ss > 0 and dr_pct >= 80 else "<text_tag color='red'>告警</text_tag>")
+    health_pct = (float(sufficient_sku) / float(total_sku) * 100) if total_sku > 0 else 0
+    health_label = "<text_tag color='green'>正常</text_tag>" if health_ok else ("<text_tag color='orange'>关注</text_tag>" if total_sku > 0 and health_pct >= 60 else "<text_tag color='red'>告警</text_tag>")
+    att_label = "<text_tag color='green'>正常</text_tag>" if attention_ok else ("<text_tag color='orange'>关注</text_tag>" if attention_count <= 5 else "<text_tag color='red'>告警</text_tag>")
+
+    dash_columns = [
+        {"tag": "column", "width": "weighted", "weight": 1,
+         "elements": [{"tag": "markdown", "content": f"<font color='green'>**{delivery_rate}**</font>\n交付率\n目标 {int(dr_target)}% {dr_label}", "text_align": "center"}] 
+         if dr_ok else 
+         [{"tag": "markdown", "content": f"<font color='orange'>**{delivery_rate}**</font>\n交付率\n目标 {int(dr_target)}% {dr_label}", "text_align": "center"}]
+         if ss > 0 and dr_pct >= 80 else
+         [{"tag": "markdown", "content": f"<font color='red'>**{delivery_rate}**</font>\n交付率\n目标 {int(dr_target)}% {dr_label}", "text_align": "center"}]},
+        {"tag": "column", "width": "weighted", "weight": 1,
+         "elements": [{"tag": "markdown", "content": f"<font color='green'>**{health_rate}**</font>\n库存健康度\n目标 {int(health_target)}% {health_label}", "text_align": "center"}] 
+         if health_ok else
+         [{"tag": "markdown", "content": f"<font color='orange'>**{health_rate}**</font>\n库存健康度\n目标 {int(health_target)}% {health_label}", "text_align": "center"}]
+         if total_sku > 0 and health_pct >= 60 else
+         [{"tag": "markdown", "content": f"<font color='red'>**{health_rate}**</font>\n库存健康度\n目标 {int(health_target)}% {health_label}", "text_align": "center"}]},
+        {"tag": "column", "width": "weighted", "weight": 1,
+         "elements": [{"tag": "markdown", "content": f"<font color='green'>**{attention_count}项**</font>\n需关注\n{att_label}", "text_align": "center"}] 
+         if attention_ok else
+         [{"tag": "markdown", "content": f"<font color='orange'>**{attention_count}项**</font>\n需关注\n{att_label}", "text_align": "center"}]
+         if attention_count <= 5 else
+         [{"tag": "markdown", "content": f"<font color='red'>**{attention_count}项**</font>\n需关注\n{att_label}", "text_align": "center"}]},
     ]
-    if risk_markdown:
-        elements.extend([
-            {"tag": "hr"},
-            {"tag": "markdown", "content": risk_markdown},
-        ])
-    elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": footer_markdown}]})
+
+    # ---- 今日结论（灰底背景块） ----
+    trend_text = ""
+    if lead_time:
+        trend_text = f" | Lead Time {lead_time}天"
+    conclusion = f"交付率 {delivery_rate}（目标 {int(dr_target)}%）{trend_text}，{attention_count} 项需关注"
+    alert_status = "告警" if not dr_ok and attention_count > 5 else ("关注" if not dr_ok or not attention_ok else "正常")
+    status_icon = "●" if alert_status == "告警" else ("⚠" if alert_status == "关注" else "✓")
+    conclusion_md = (
+        f"**{status_icon} 今日{alert_status}**\n"
+        f"<font color='grey'>{conclusion}</font>"
+    )
+
+    # ---- 需关注区域（最多3条 + 角色标签） ----
+    attention_items = []
+    if d_int > 0:
+        attention_items.append(f"- [交付] {delay} 单延迟，需跟进处理")
+    if _safe_int(shortage_sku) > 0 and top_sku != "无":
+        attention_items.append(f"- [采购] 核心物料 {top_sku} 断供，影响 {shortage_sku} 项")
+    if warning_sku > 0:
+        attention_items.append(f"- [库存] {warning_sku} 个SKU预警，建议补货")
+    if future_short and _safe_int(future_short) > 0:
+        attention_items.append(f"- [预测] 未来3天 {future_short} 单有缺货风险")
+    attention_text = "\n".join(attention_items[:3])
+    if len(attention_items) > 3:
+        attention_text += f"\n+{len(attention_items) - 3} 项详情"
+
+    # ---- 灰度信息行 ----
+    total_anomalies = d_int + _safe_int(shortage_sku) + warning_sku
+    gray_note = f"今日共 {total_anomalies} 项异常，{min(len(attention_items), 3)} 项需关注，其余执行层闭环中 | {total} 单资产池"
+
+    # ---- header 颜色：正常时蓝色 ----
+    if not dr_ok and attention_count > 5:
+        header_color = "red"
+    elif not dr_ok or not attention_ok:
+        header_color = "yellow"
+    else:
+        header_color = "blue"
+
+    # ---- 组装 card ----
+    elements = [
+        {"tag": "column_set", "flex_mode": "trisect", "columns": dash_columns},
+        {"tag": "hr"},
+        {"tag": "markdown", "content": conclusion_md},
+    ]
+    if attention_text:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "**需关注**\n" + attention_text})
+
+    if dashboard_url:
+        elements.append({
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "查看详情"},
+                    "type": "primary",
+                    "url": dashboard_url,
+                    "multi_url": {"url": dashboard_url, "pc_url": dashboard_url, "android_url": dashboard_url, "ios_url": dashboard_url}
+                },
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "查看交付明细"},
+                    "type": "default",
+                    "url": dashboard_url,
+                    "multi_url": {"url": dashboard_url, "pc_url": dashboard_url, "android_url": dashboard_url, "ios_url": dashboard_url}
+                },
+            ]
+        })
+
+    # note: 时间戳 + 灰度信息
+    now_ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M CST")
+    elements.append({"tag": "note", "elements": [
+        {"tag": "plain_text", "content": f"{gray_note}"},
+        {"tag": "plain_text", "content": f"批次 {batch} | {now_ts} | AI排单引擎"},
+    ]})
 
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
-            "template": color,
+            "template": header_color,
             "title": {
-                "content": f"📊 供应链 AI 经营日报 (批次: {batch})",
+                "content": f"供应链经营日报 ({batch})",
                 "tag": "plain_text"
             }
         },
         "elements": elements
     }
-
-    if dashboard_url:
-        card["elements"].append({
-            "tag": "action",
-            "actions": [{
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "📈 查看多维表格全局大盘"},
-                "type": "primary",
-                "url": dashboard_url,
-                "multi_url": {"url": dashboard_url, "pc_url": dashboard_url,
-                              "android_url": dashboard_url, "ios_url": dashboard_url}
-            }]
-        })
-
     return card
 
 
@@ -1165,9 +1285,13 @@ def execute_triple_track_dispatch(report: Dict[str, str]):
 
     # ---- Track 1：物料异常流（条件触发） ----
     if shortage_sku > 0 and procurement_url:
-        card = _build_procurement_card(report)
-        all_ok = _send_card_to_webhook(procurement_url, card, "Track1-物料异常流") and all_ok
-        any_attempted = True
+        try:
+            card = _build_procurement_card(report)
+            all_ok = _send_card_to_webhook(procurement_url, card, "Track1-物料异常流") and all_ok
+            any_attempted = True
+        except Exception as e:
+            print(f"  [X] Track1-物料异常流 构建或发送异常: {e}")
+            all_ok = False
     elif shortage_sku > 0 and not procurement_url:
         print("  [SKIP] Track1-物料异常流：PROCUREMENT_WEBHOOK_URL 未配置")
     else:
@@ -1175,9 +1299,13 @@ def execute_triple_track_dispatch(report: Dict[str, str]):
 
     # ---- Track 2：排单确认流（个人通知，不复用采购/产协群） ----
     if planner_url and planner_url != procurement_url:
-        card = _build_planner_card(report)
-        all_ok = _send_card_to_webhook(planner_url, card, "Track2-订单确认流") and all_ok
-        any_attempted = True
+        try:
+            card = _build_planner_card(report)
+            all_ok = _send_card_to_webhook(planner_url, card, "Track2-订单确认流") and all_ok
+            any_attempted = True
+        except Exception as e:
+            print(f"  [X] Track2-订单确认流 构建或发送异常: {e}")
+            all_ok = False
     elif planner_url and planner_url == procurement_url:
         print("  [SKIP] Track2-订单确认流：PLANNER_WEBHOOK_URL 与采购群相同，避免把个人通知发到群里")
     else:
@@ -1185,9 +1313,13 @@ def execute_triple_track_dispatch(report: Dict[str, str]):
 
     # ---- Track 3：战略大盘流（默认发送） ----
     if boss_url:
-        card = _build_boss_card(report)
-        all_ok = _send_card_to_webhook(boss_url, card, "Track3-战略大盘流") and all_ok
-        any_attempted = True
+        try:
+            card = _build_boss_card(report)
+            all_ok = _send_card_to_webhook(boss_url, card, "Track3-战略大盘流") and all_ok
+            any_attempted = True
+        except Exception as e:
+            print(f"  [X] Track3-战略大盘流 构建或发送异常: {e}")
+            all_ok = False
     else:
         print("  [SKIP] Track3-战略大盘流：BOSS_WEBHOOK_URL 未配置")
 
@@ -1239,8 +1371,8 @@ def main():
         print("  [OK] 发送消息成功")
 
         # ---- 步骤 5 ----
-        print("[5/7] 三线异步流卡片推送...")
-        execute_triple_track_dispatch(record)
+        print("[5/7] 三线异步流卡片推送（已迁移到排单员确认流程，此处跳过）...")
+        # execute_triple_track_dispatch(record)  # 群通知由排单员确认后触发，避免独立流程绕过确认
 
         # ---- 步骤 6 ----
         print("[6/7] 判断是否需要创建跟进任务...")

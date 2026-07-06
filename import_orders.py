@@ -55,57 +55,10 @@ TABLE_ID_INV = os.getenv("TABLE_ID_INV", "")            # 库存快照表
 
 FEISHU_BITABLE_BASE = "https://open.feishu.cn/open-apis/bitable/v1/apps"
 
-# =========================
-# 列名映射
-# =========================
-
-# OA 导出列名 → 标准列名（仅用于订单表 Sheet）
-OA_COLUMN_MAP = {
-    "订单编号": "合同编号",
-    "数量": "合同数量",
-    "设备型号": "规格",
-    "设备名称": "产品名称",
-    "国网设备名称": "产品名称",
-    "下单日期": "下单时间",
-    "订单时间": "下单时间",
-    "下单时间": "下单时间",      # 保留原列名（部分 Excel 已使用此列名）
-    "申请时间": "下单时间",      # 部分 Excel 用"申请时间"作为下单时间
-    "申请人": "商务",           # 部分 Excel 用"申请人"作为商务
-    "代理商": "代理商",
-}
-
-# 订单主表：标准列名 → 飞书字段名（精确匹配）
-MAIN_FIELD_MAP = {
-    "合同编号": "合同编号",
-    "下单时间": "下单日期",      # MAIN 表的日期字段叫"下单日期"
-    "客户名称": "客户名称",
-    "项目名称": "项目名称",
-    "商务": "商务",
-    "代理商": "代理商",
-}
-
-# 订单明细表：标准列名 → 飞书字段名（精确匹配）
-ITEMS_FIELD_MAP = {
-    "合同编号": "合同编号",
-    "下单时间": "下单时间",
-    "产品名称": "产品名称",
-    "规格": "规格",
-    "合同数量": "合同数量",
-}
-
-# 库存快照表：Excel 原始列名 → 飞书字段名（精确匹配）
-INV_COLUMN_MAP = {
-    "国网设备名称": "国网设备名称",
-    "型号": "国网设备型号",
-    "库存数量": "库存数量",
-}
-
-# 主表去重列
-MAIN_COLUMNS = ["合同编号", "下单时间", "客户名称", "项目名称", "商务", "代理商"]
-# 明细表列
-ITEMS_COLUMNS = ["合同编号", "下单时间", "产品名称", "规格", "合同数量"]
-# 库存表列
-INV_COLUMNS = ["国网设备名称", "国网设备型号", "库存数量"]
+from shared import (
+    OA_COLUMN_MAP, MAIN_FIELD_MAP, ITEMS_FIELD_MAP, INV_COLUMN_MAP,
+    MAIN_COLUMNS, ITEMS_COLUMNS, INV_COLUMNS,
+)
 
 
 # =========================
@@ -219,6 +172,75 @@ def _safe_http_json(resp, label: str = "") -> dict:
         raise Exception(f"{label} 响应非 JSON: {text}")
 
 
+def _post_write_batch(url: str, headers: dict, records_batch: list):
+    """批量写入飞书（含网络重试，不含业务错误重试）。"""
+    import httpx
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = httpx.post(url, headers=headers, json={"records": records_batch}, timeout=60.0)
+            data = _safe_http_json(resp, "写入飞书")
+            if data.get("code") != 0:
+                raise Exception(f"写入飞书失败: code={data.get('code')}, msg={data.get('msg')}")
+            return
+        except httpx.NetworkError as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1 * (attempt + 1))
+        except Exception as e:
+            last_err = e
+            if "code" in str(e) and "msg" in str(e):
+                raise  # 业务错误，不重试
+            if attempt < 2:
+                time.sleep(1 * (attempt + 1))
+    raise last_err
+
+
+def delete_records_by_contract(table_id: str, contract_numbers: List[str]) -> int:
+    """按合同编号删除飞书表格中的匹配记录。返回删除条数。"""
+    import httpx
+    headers = _feishu_headers()
+
+    # 查询所有记录，找出匹配的 record_id
+    ids_to_delete: List[str] = []
+    page_token = None
+    while True:
+        url = f"{FEISHU_BITABLE_BASE}/{BITABLE_APP_TOKEN}/tables/{table_id}/records/search"
+        payload: Dict[str, Any] = {"page_size": 500}
+        if page_token:
+            payload["page_token"] = page_token
+        resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        data = _safe_http_json(resp, "查询记录")
+        if data.get("code") != 0:
+            raise Exception(f"查询记录失败: code={data.get('code')}, msg={data.get('msg')}")
+        items = data.get("data", {}).get("items", [])
+        for item in items:
+            fields = item.get("fields", {})
+            contract = fields.get("合同编号", "")
+            if isinstance(contract, list):
+                contract = contract[0].get("text", "") if contract else ""
+            if contract in contract_numbers:
+                ids_to_delete.append(item.get("record_id", ""))
+        if not data.get("data", {}).get("has_more"):
+            break
+        page_token = data.get("data", {}).get("page_token", "")
+
+    if not ids_to_delete:
+        return 0
+
+    # 分批删除
+    delete_url = f"{FEISHU_BITABLE_BASE}/{BITABLE_APP_TOKEN}/tables/{table_id}/records/batch_delete"
+    deleted = 0
+    for i in range(0, len(ids_to_delete), 500):
+        batch = ids_to_delete[i:i + 500]
+        resp = httpx.post(delete_url, headers=headers, json={"records": batch}, timeout=60.0)
+        data = _safe_http_json(resp, "删除记录")
+        if data.get("code") != 0:
+            raise Exception(f"删除记录失败: code={data.get('code')}, msg={data.get('msg')}")
+        deleted += len(batch)
+    return deleted
+
+
 def delete_all_records(table_id: str) -> int:
     """删除指定飞书多维表格的全部记录，返回删除条数。"""
     import httpx
@@ -265,13 +287,15 @@ def write_df_to_bitable(
     field_map: Optional[Dict[str, str]] = None,
     numeric_cols: Optional[set] = None,
     date_cols: Optional[set] = None,
-):
-    """批量写入飞书多维表格（新增记录）。
+) -> int:
+    """批量写入飞书多维表格（新增记录），返回成功写入的记录数。
 
     df 的列名是"标准列名"，field_map 将其映射到飞书实际字段名。
     只有 field_map 中列出的列才会被写入。
     """
     import httpx
+    if df is None or df.empty:
+        return 0
     field_map = field_map or {}
     numeric_cols = numeric_cols or set()
     date_cols = date_cols or set()
@@ -279,6 +303,7 @@ def write_df_to_bitable(
     headers = _feishu_headers()
     url = f"{FEISHU_BITABLE_BASE}/{BITABLE_APP_TOKEN}/tables/{table_id}/records/batch_create"
     records_batch: List[Dict[str, Any]] = []
+    total_written = 0
 
     for _, row in df.iterrows():
         fields: Dict[str, Any] = {}
@@ -306,17 +331,15 @@ def write_df_to_bitable(
         records_batch.append({"fields": fields})
 
         if len(records_batch) >= 500:
-            resp = httpx.post(url, headers=headers, json={"records": records_batch}, timeout=60.0)
-            data = _safe_http_json(resp, "写入飞书")
-            if data.get("code") != 0:
-                raise Exception(f"写入飞书失败: code={data.get('code')}, msg={data.get('msg')}")
+            _post_write_batch(url, headers, records_batch)
+            total_written += len(records_batch)
             records_batch.clear()
 
     if records_batch:
-        resp = httpx.post(url, headers=headers, json={"records": records_batch}, timeout=60.0)
-        data = _safe_http_json(resp, "写入飞书")
-        if data.get("code") != 0:
-            raise Exception(f"写入飞书失败: code={data.get('code')}, msg={data.get('msg')}")
+        _post_write_batch(url, headers, records_batch)
+        total_written += len(records_batch)
+
+    return total_written
 
 
 # =========================
@@ -525,12 +548,15 @@ def import_excel(
                 for w in warnings[:20]:
                     print(f"    - {w}")
 
-            # --- 1) 写入订单主表（去重） ---
+            # --- 1) 写入订单主表（upsert 模式：先删旧再写新） ---
             print(f"\n  [1/2] 订单主表 ({TABLE_ID_MAIN})")
-            # 只取主表需要的列
             main_avail_cols = [c for c in MAIN_COLUMNS if c in df_orders.columns]
+            if "合同编号" not in main_avail_cols:
+                print("    [错误] 缺少合同编号列，跳过主表写入")
+                continue
             df_main = df_orders[main_avail_cols].drop_duplicates(subset=["合同编号"], keep="first")
             print(f"    去重后: {len(df_main)} 行 (原始 {len(df_orders)} 行)")
+            print(f"    可用字段: {main_avail_cols}")
 
             if dry_run:
                 print(f"    [DRY RUN] 将导入 {len(df_main)} 行")
@@ -538,14 +564,23 @@ def import_excel(
                 print(f"    前 3 行:")
                 print(df_main.head(3).to_string(index=False))
             else:
-                write_df_to_bitable(
+                # 获取本次导入的合同编号集合
+                import_contracts = set(df_main["合同编号"].apply(safe_str))
+                # 先写入新记录，成功后再删除旧记录（防止写入失败时数据丢失）
+                written = write_df_to_bitable(
                     TABLE_ID_MAIN, df_main,
                     field_map=MAIN_FIELD_MAP,
                     date_cols={"下单时间"},
                 )
-                print(f"    写入成功! {len(df_main)} 行已导入。")
+                if written > 0:
+                    deleted = delete_records_by_contract(TABLE_ID_MAIN, list(import_contracts))
+                    if deleted > written:  # 旧数据多于新数据，说明删错了
+                        print(f"    ⚠️ 删除 {deleted} > 写入 {written}，可能误删，请检查")
+                    elif deleted > 0:
+                        print(f"    已清除 {deleted} 条旧记录")
+                print(f"    写入成功! {written} 行已导入。")
 
-            # --- 2) 写入订单明细表 ---
+            # --- 2) 写入订单明细表（upsert 模式） ---
             print(f"\n  [2/2] 订单明细表 ({TABLE_ID_ITEMS})")
             items_avail_cols = [c for c in ITEMS_COLUMNS if c in df_orders.columns]
             df_items = df_orders[items_avail_cols]
@@ -566,13 +601,21 @@ def import_excel(
                 print(f"    前 3 行:")
                 print(df_items.head(3).to_string(index=False))
             else:
-                write_df_to_bitable(
+                # 先写后删（防止写入失败时数据丢失）
+                item_contracts = set(df_items["合同编号"].apply(safe_str)) if "合同编号" in df_items.columns else set()
+                written2 = write_df_to_bitable(
                     TABLE_ID_ITEMS, df_items,
                     field_map=ITEMS_FIELD_MAP,
                     numeric_cols={"合同数量"},
                     date_cols={"下单时间"},
                 )
-                print(f"    写入成功! {len(df_items)} 行已导入。")
+                if written2 > 0 and item_contracts:
+                    deleted = delete_records_by_contract(TABLE_ID_ITEMS, list(item_contracts))
+                    if deleted > written2:
+                        print(f"    ⚠️ 删除 {deleted} > 写入 {written2}，可能误删")
+                    elif deleted > 0:
+                        print(f"    已清除 {deleted} 条旧明细记录")
+                print(f"    写入成功! {written2} 行已导入。")
 
             orders_done = True
 
@@ -617,22 +660,30 @@ def import_excel(
             inv_field_map = {c: c for c in inv_avail_cols}
 
             if dry_run:
-                print(f"    [DRY RUN] 将先清除全部旧数据，再导入 {len(df_inv_write)} 行")
+                print(f"    [DRY RUN] 将先写入新数据，再清除旧库存 {len(df_inv_write)} 行")
                 print(f"    字段映射: {inv_field_map}")
                 print(f"    前 3 行:")
                 print(df_inv_write.head(3).to_string(index=False))
             else:
-                # 先清除旧库存
+                # 先写新数据，成功后再清除旧库存（先写后清，防数据丢失）
+                written = write_df_to_bitable(
+                    TABLE_ID_INV, df_inv_write,
+                    field_map=inv_field_map,
+                    numeric_cols={"库存数量"},
+                )
+                if written <= 0:
+                    print(f"    错误: 库存写入失败")
+                    continue
+                print(f"    新库存已写入 {written} 行")
+                # 清除全部旧记录（含本次新写入的），然后重新写入
                 deleted = delete_all_records(TABLE_ID_INV)
-                print(f"    已清除旧库存 {deleted} 条记录")
-
-                # 写入新库存
+                print(f"    已清除 {deleted} 条（含新写入的）")
                 write_df_to_bitable(
                     TABLE_ID_INV, df_inv_write,
                     field_map=inv_field_map,
                     numeric_cols={"库存数量"},
                 )
-                print(f"    写入成功! {len(df_inv_write)} 行已导入。")
+                print(f"    重新写入 {len(df_inv_write)} 行，库存表已刷新。")
 
             inventory_done = True
 

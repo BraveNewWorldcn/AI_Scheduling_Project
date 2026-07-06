@@ -32,11 +32,16 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 
 logger = logging.getLogger("sf_shipping")
+
+
+class SFAPIError(Exception):
+    """顺丰 API 通用异常（替代 HTTPException 用于后台线程）"""
+    pass
 
 # =========================
 # 环境变量
@@ -120,40 +125,47 @@ class SFClient:
 
     def _sign(self, msg_data: str, timestamp: str) -> str:
         """MD5 签名：Base64(MD5(msgData + timestamp + checkWord))  不 URL 编码"""
-        raw = msg_data + timestamp + self.checkword
-        md5_digest = hashlib.md5(raw.encode("utf-8")).digest()
-        return base64.b64encode(md5_digest).decode("utf-8")
+        try:
+            raw = msg_data + timestamp + self.checkword
+            md5_digest = hashlib.md5(raw.encode("utf-8")).digest()
+            return base64.b64encode(md5_digest).decode("utf-8")
+        except Exception as e:
+            # 避免 checkword 泄露到日志中
+            logger.error(f"SF签名失败: {type(e).__name__}")
+            raise SFAPIError("顺丰签名生成失败")
 
     def _call(self, service_code: str, msg_data: dict) -> dict:
         """通用 API 调用"""
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
-        msg_data_str = json.dumps(msg_data, ensure_ascii=False)
-        msg_digest = self._sign(msg_data_str, timestamp)
-
-        headers = {
-            "appCode": self.partner_id,
-            "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
-            "timestamp": timestamp,
-        }
-        form = {
-            "partnerID": self.partner_id,
-            "requestID": uuid.uuid4().hex,
-            "serviceCode": service_code,
-            "timestamp": timestamp,
-            "msgData": msg_data_str,
-            "msgDigest": msg_digest,
-        }
-
         try:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
+            msg_data_str = json.dumps(msg_data, ensure_ascii=False)
+            msg_digest = self._sign(msg_data_str, timestamp)
+
+            headers = {
+                "appCode": self.partner_id,
+                "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+                "timestamp": timestamp,
+            }
+            form = {
+                "partnerID": self.partner_id,
+                "requestID": uuid.uuid4().hex,
+                "serviceCode": service_code,
+                "timestamp": timestamp,
+                "msgData": msg_data_str,
+                "msgDigest": msg_digest,
+            }
+
             resp = httpx.post(self.server_url, headers=headers, data=form, timeout=30.0)
             result = resp.json()
             return result
+        except SFAPIError:
+            raise
         except httpx.TimeoutException:
             logger.error(f"SF API [{service_code}] timeout")
-            raise HTTPException(status_code=504, detail="顺丰接口超时，请稍后重试")
+            raise SFAPIError("顺丰接口超时，请稍后重试")
         except Exception as e:
-            logger.error(f"SF API [{service_code}] error: {e}")
-            raise HTTPException(status_code=502, detail=f"顺丰接口异常: {e}")
+            logger.error(f"SF API [{service_code}] error: {type(e).__name__}: {e}")
+            raise SFAPIError(f"顺丰接口异常: {type(e).__name__}")
 
     # ---- SFWAYBILL 运单查询（替代路由查询） ----
     def query_sfwaybill(self, search_no: str, search_type: str = "1") -> dict:
@@ -453,6 +465,16 @@ def _parse_field(value) -> str:
 router = APIRouter(prefix="/shipping", tags=["顺丰物流"])
 
 
+# 将 SFAPIError 转为 HTTP 错误响应（FastAPI 路由中使用）
+def _wrap_sf_call(fn):
+    """包装 SF API 调用，将 SFAPIError 转为 HTTPException"""
+    from fastapi import HTTPException
+    try:
+        return fn()
+    except SFAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 def _get_sf_client() -> Optional[SFClient]:
     if not SF_PARTNER_ID or not SF_CHECKWORD:
         return None
@@ -594,6 +616,7 @@ def refresh_all_active() -> List[dict]:
             logger.error(f"查询 {tn} 失败: {e}")
 
     if newly_signed:
+        _sync_signed_to_schedule(newly_signed)
         _notify_signed(newly_signed)
 
     return results
@@ -624,6 +647,49 @@ def _update_feishu_by_tracking(tracking_number: str, info: dict):
             }}, timeout=15.0)
     except Exception as e:
         logger.error(f"按单号飞书更新失败: {e}")
+
+
+def _sync_signed_to_schedule(signed_rows: List[dict]):
+    """签收后同步更新 AI排单总表(TABLE_ID_DETAIL) 的订单状态为'已签收'"""
+    TABLE_ID_DETAIL = os.getenv("TABLE_ID_DETAIL", "")
+    TABLE_ID_SHIPPING = os.getenv("TABLE_ID_SHIPPING", "")
+    BITABLE_APP_TOKEN = os.getenv("BITABLE_APP_TOKEN", "")
+
+    if not _feishu_adapter or not TABLE_ID_DETAIL or not TABLE_ID_SHIPPING or not BITABLE_APP_TOKEN:
+        return
+
+    try:
+        token = _feishu_adapter.get_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+
+        for r in signed_rows:
+            tn = r["tracking_number"]
+            shipping_items = _feishu_search_by_tracking(tn)
+            for item in shipping_items:
+                contract_no = _parse_field(item.get("fields", {}).get("合同编号", ""))
+                if not contract_no:
+                    continue
+                # 在排单总表中按合同编号搜索
+                search_resp = httpx.post(
+                    f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{TABLE_ID_DETAIL}/records/search",
+                    headers=headers,
+                    json={"filter": {"conjunction": "and", "conditions": [
+                        {"field_name": "合同编号", "operator": "is", "value": [contract_no]}
+                    ]}, "page_size": 10},
+                    timeout=15.0,
+                )
+                detail_items = search_resp.json().get("data", {}).get("items", [])
+                for di in detail_items:
+                    record_id = di["record_id"]
+                    httpx.put(
+                        f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{TABLE_ID_DETAIL}/records/{record_id}",
+                        headers=headers,
+                        json={"fields": {"订单状态": "已签收"}},
+                        timeout=15.0,
+                    )
+                    logger.info(f"排单总表已签收: 合同={contract_no} 单号={tn}")
+    except Exception as e:
+        logger.error(f"排单总表签收同步失败: {e}")
 
 
 def _notify_signed(rows: List[dict]):

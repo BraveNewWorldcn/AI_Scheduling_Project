@@ -112,6 +112,7 @@ TABLE_ID_FINANCE_SUMMARY = os.getenv("TABLE_ID_FINANCE_SUMMARY", "")      # 财�
 # ⚠️ 产品计费规则主表为只读数据源，绝对禁止任何形式的写入、修改、删除操作
 TABLE_ID_BILLING_RULES = os.getenv("TABLE_ID_BILLING_RULES", "")          # 产品计费规则主表（只读）
 TABLE_ID_FINANCE_DETAIL = os.getenv("TABLE_ID_FINANCE_DETAIL", "")        # 财务对账明细表
+TABLE_ID_AUDIT = os.getenv("TABLE_ID_AUDIT", "")                            # 排单审计记录表
 
 # ===== 输出表字段映射 =====
 OUTPUT_SUMMARY_FIELDS_MAP = {
@@ -359,7 +360,9 @@ def build_inventory_index(inv: pd.DataFrame):
         return
 
     # 按 SKU 聚合：合并同一SKU多批次库存，避免取max单行而低估总库存
-    if "SKU" in inv.columns and "库存数量" in inv.columns:
+    # 但若所有记录的 SKU 列全空（导入时 SKU 为 lookup 字段），则跳过聚合
+    sku_has_data = "SKU" in inv.columns and inv["SKU"].dropna().apply(lambda x: str(x).strip() if x else "").str.len().sum() > 0
+    if "SKU" in inv.columns and "库存数量" in inv.columns and sku_has_data:
         agg_map = {"库存数量": "sum"}
         for col in ["国网设备型号", "国网设备名称", "设备型号", "设备名称"]:
             if col in inv.columns:
@@ -582,8 +585,20 @@ def schedule_global_lock(timeout_seconds: int = 1):
             os.write(fd, f"{os.getpid()} {datetime.now().isoformat()}".encode("utf-8"))
             break
         except FileExistsError:
+            # 检查是否是僵尸锁（超过 1 小时）
             try:
-                if time.time() - os.path.getmtime(SCHEDULE_LOCK_PATH) > 60 * 60:
+                # 先读取锁文件内容，校验 PID 是否还在运行
+                with open(SCHEDULE_LOCK_PATH, "r") as lf:
+                    stale = True
+                    try:
+                        content = lf.read().strip()
+                        lock_pid = int(content.split()[0]) if content else 0
+                        # 检查该 PID 的进程是否还存在
+                        os.kill(lock_pid, 0)  # 发送信号 0 不杀死进程，仅检查存在性
+                        stale = False  # PID 存在，不是僵尸锁
+                    except (OSError, ValueError, IndexError):
+                        stale = True  # 无法读取 PID 或进程不存在
+                if stale and time.time() - os.path.getmtime(SCHEDULE_LOCK_PATH) > 60 * 60:
                     os.remove(SCHEDULE_LOCK_PATH)
                     continue
             except FileNotFoundError:
@@ -834,6 +849,15 @@ def upsert_bitable_records_by_key(
             rid = safe_str(r.get("_record_id", ""))
             if k and rid and k not in key_to_record:
                 key_to_record[k] = rid
+    elif existing is not None and not existing.empty and len(df) > 10 and key_field_name not in (existing.columns or []):
+        # 关键字段不匹配，静默全量重复创建的风险
+        existing_cols = list(existing.columns) if existing is not None else []
+        err_msg = (
+            f"upsert 危险操作：表中有 {len(existing)} 条已有记录，但找不到匹配键字段 "
+            f"'{key_field_name}'（表实际列名: {existing_cols}），避免全量重复写入已拒绝。"
+        )
+        print(f"[UPSERT 阻断] {err_msg}")
+        return err_msg
 
     to_update: List[Dict[str, Any]] = []
     to_create: List[Dict[str, Any]] = []
@@ -860,11 +884,12 @@ def upsert_bitable_records_by_key(
     return None
 
 
-def _sync_finance_summary() -> Dict[str, Any]:
+def _sync_finance_summary(force: bool = False) -> Dict[str, Any]:
     """同步销售订单主表 → 财务对账总表（Upsert by 合同编号）。
 
     同步字段：合同编号、下单日期、客户名称、项目名称、商务、代理商。
     保留字段（不覆盖）：项目类型、备注、AI项目金额、人工核对金额、AI费用检查。
+    force=True 时强制重同步所有合同（已锁定的仍然跳过）。
     """
     if not TABLE_ID_FINANCE_SUMMARY:
         return {"ok": False, "error": "未配置 TABLE_ID_FINANCE_SUMMARY，请在 .env 中设置"}
@@ -915,13 +940,15 @@ def _sync_finance_summary() -> Dict[str, Any]:
                 sync_df[col] = sync_df[exist_col].fillna("")
                 sync_df.drop(columns=[exist_col], inplace=True)
 
-    # 过滤：已锁定或已同步的合同跳过，只同步新合同和待重新同步的合同
+    # 过滤：已锁定的合同跳过（不覆盖人工核对金额）
+    # force=True 时只跳过已锁定，否则也跳过已同步
     before = len(sync_df)
     sync_df = sync_df[sync_df.apply(lambda r: (
-        safe_str(r.get("人工核对金额", "")) == "" and
-        safe_str(r.get("同步状态", "")) != "已同步"
+        safe_str(r.get("人工核对金额", "")) == ""
     ), axis=1)]
-    print(f"[Finance Sync Summary] {before} → {len(sync_df)} (跳过已锁定/已同步)")
+    if not force:
+        sync_df = sync_df[sync_df["同步状态"] != "已同步"]
+    print(f"[Finance Sync Summary] {before} → {len(sync_df)} (force={force}, 跳过已锁定/{'跳过已同步' if not force else '含已同步'})")
     if sync_df.empty:
         return {"ok": True, "synced": 0, "skipped": before}
 
@@ -1693,6 +1720,13 @@ def load_data():
     try:
         items_df, sku_df, inv_df = load_feishu_data()
 
+        # 源头过滤：费用类明细不参与任何库存/缺货计算和展示
+        if "产品名称" in items_df.columns:
+            fee_mask = items_df["产品名称"].astype(str).str.contains("费", na=False)
+            if fee_mask.sum() > 0:
+                items_df = items_df[~fee_mask].copy()
+                print(f"[费用过滤] 已从数据源排除 {fee_mask.sum()} 行费用类明细")
+
         with data_cache_lock:
             data_cache["items"] = items_df
             data_cache["sku"] = sku_df
@@ -1701,14 +1735,14 @@ def load_data():
         # ===== 验证表字段完整性 =====
         print("\n【表字段验证】")
 
-        required_items_cols = ["合同编号", "合同数量", "SKU编码"]
+        required_items_cols = ["合同编号", "合同数量"]
         optional_items_cols = ["产品名称", "规格", "库存可用量", "缺口数量", "库存状态", "预计到货日期", "是否RB800", "排单批次号",
                                "是否紧急订单", "是否换货订单", "是否补发订单", "是否维修订单"]
 
         required_sku_cols = ["产品编码SKU", "标准生产周期"]
         optional_sku_cols = ["设备名称", "设备型号", "是否新产品", "是否自研", "是否外采"]
 
-        required_inv_cols = ["SKU", "库存数量"]
+        required_inv_cols = ["库存数量"]
         optional_inv_cols = ["库存日期", "国网设备名称", "国网设备型号", "待采购出库", "在途数量", "数据来源", "导入批次号"]
 
         def check_columns(df, table_name, required_cols, optional_cols=None):
@@ -2082,9 +2116,6 @@ def apply_capacity_scheduling(summary: pd.DataFrame, today: date) -> Tuple[pd.Da
         return summary, 0
 
     df = summary.copy()
-    # 从产能调度中排除非全部可发的合同（兼容旧版"缺货"状态）
-    if "整体状态" in df.columns:
-        df = df[df["整体状态"] == "全部可发"]
     # 只做一次日期解析，后续用 date 对象比较
     df["__ship_date"] = df["AI建议发货时间"].apply(lambda x: next_working_day(parse_date_to_date(x) or today))
 
@@ -2231,7 +2262,7 @@ def shortage_sku_count_from_list(value: Any) -> int:
 
 def normalize_order_status(value: Any, default: str = "待确认") -> str:
     status = safe_str(value)
-    if status in {"待确认", "已确认", "已发货"}:
+    if status in {"待确认", "已确认", "已发货", "已签收"}:
         return status
     return default
 
@@ -2439,9 +2470,16 @@ def build_reservation_rows(
     if not pending_contracts:
         return pd.DataFrame()
 
-    required = {"合同编号", "SKU编码", "合同数量"}
+    required = {"合同编号", "合同数量"}
     if not required.issubset(set(detail.columns)):
         return pd.DataFrame()
+    
+    # SKU编码不存在时用产品名称兜底
+    if "SKU编码" not in detail.columns:
+        if "产品名称" in detail.columns:
+            detail["SKU编码"] = detail["产品名称"].astype(str).apply(safe_str)
+        else:
+            detail["SKU编码"] = ""
 
     qty_by_contract_sku: Dict[Tuple[str, str], float] = {}
     now_str = datetime.now().strftime("%Y-%m-%d")
@@ -2762,6 +2800,50 @@ def finance_page():
     return HTMLResponse(content=FINANCE_HTML)
 
 
+def delete_records_by_contract(table_id: str, contract_numbers: List[str]) -> int:
+    """按合同编号删除飞书表格中的匹配记录。返回删除条数。"""
+    headers = _feishu_headers()
+
+    # 查询所有记录，找出匹配的 record_id
+    ids_to_delete: List[str] = []
+    page_token = None
+    while True:
+        url = f"{FEISHU_BITABLE_BASE}/tables/{table_id}/records/search"
+        payload: Dict[str, Any] = {"page_size": 500}
+        if page_token:
+            payload["page_token"] = page_token
+        resp = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        data = _safe_http_json(resp, "查询记录")
+        if data.get("code") != 0:
+            raise Exception(f"查询记录失败: code={data.get('code')}, msg={data.get('msg')}")
+        items = data.get("data", {}).get("items", [])
+        for item in items:
+            fields = item.get("fields", {})
+            contract = fields.get("合同编号", "")
+            if isinstance(contract, list):
+                contract = contract[0].get("text", "") if contract else ""
+            if contract in contract_numbers:
+                ids_to_delete.append(item.get("record_id", ""))
+        if not data.get("data", {}).get("has_more"):
+            break
+        page_token = data.get("data", {}).get("page_token", "")
+
+    if not ids_to_delete:
+        return 0
+
+    # 分批删除
+    delete_url = f"{FEISHU_BITABLE_BASE}/tables/{table_id}/records/batch_delete"
+    deleted = 0
+    for i in range(0, len(ids_to_delete), 500):
+        batch = ids_to_delete[i:i + 500]
+        resp = httpx.post(delete_url, headers=headers, json={"records": batch}, timeout=60.0)
+        data = _safe_http_json(resp, "删除记录")
+        if data.get("code") != 0:
+            raise Exception(f"删除记录失败: code={data.get('code')}, msg={data.get('msg')}")
+        deleted += len(batch)
+    return deleted
+
+
 def delete_all_records(table_id: str) -> int:
     """删除指定飞书多维表格的全部记录，返回删除条数。"""
     headers = _feishu_headers()
@@ -2810,50 +2892,12 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
         Sheet2（库存表）: 国网设备名称, 型号, 库存数量
     """
     import io
+    from shared import OA_COLUMN_MAP, MAIN_FIELD_MAP, ITEMS_FIELD_MAP, INV_COLUMN_MAP
     try:
         contents = await file.read()
         xl = pd.ExcelFile(io.BytesIO(contents))
     except Exception as e:
         return {"ok": False, "error": f"无法读取 Excel 文件: {e}"}
-
-    # OA 导出列名 → 标准列名
-    OA_COLUMN_MAP = {
-        "订单编号": "合同编号",
-        "数量": "合同数量",
-        "设备型号": "规格",
-        "设备名称": "产品名称",
-        "国网设备名称": "产品名称",
-        "下单日期": "下单时间",
-        "订单时间": "下单时间",
-        "下单时间": "下单时间",
-        "申请时间": "下单时间",
-        "申请人": "商务",
-    }
-
-    # 订单主表：标准列名 → 飞书字段名
-    MAIN_FIELD_MAP = {
-        "合同编号": "合同编号",
-        "下单时间": "下单日期",      # MAIN 表字段叫「下单日期」
-        "客户名称": "客户名称",
-        "项目名称": "项目名称",
-        "商务": "商务",
-    }
-
-    # 订单明细表：标准列名 → 飞书字段名
-    ITEMS_FIELD_MAP = {
-        "合同编号": "合同编号",
-        "下单时间": "下单时间",
-        "产品名称": "产品名称",
-        "规格": "规格",
-        "合同数量": "合同数量",
-    }
-
-    # 库存表：Excel 列名 → 飞书字段名
-    INV_COLUMN_MAP = {
-        "国网设备名称": "国网设备名称",
-        "型号": "国网设备型号",
-        "库存数量": "库存数量",
-    }
 
     results = []
     orders_done = False
@@ -2919,12 +2963,18 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
             if "SKU编码" in df.columns:
                 sku_empty = (df["SKU编码"] == "").sum()
 
-            # 1) 写入订单主表（去重）
-            main_avail = [c for c in ["合同编号", "下单时间", "客户名称", "项目名称", "商务"] if c in df.columns]
+            # 1) 写入订单主表（先删后写：防止新记录被误删）
+            main_avail = [c for c in ["合同编号", "下单时间", "客户名称", "项目名称", "商务", "代理商"] if c in df.columns]
             df_main = df[main_avail].drop_duplicates(subset=["合同编号"], keep="first")
-            print(f"[导入] 主表去重: {len(df_main)} 行 (原始 {len(df)} 行)")
+            print(f"[导入] 主表去重: {len(df_main)} 行 (原始 {len(df)} 行), 可用字段={main_avail}")
 
             try:
+                import_contracts = list(set(df_main["合同编号"].apply(safe_str)))
+                # 先删旧：清除相同合同号的旧记录
+                deleted = delete_records_by_contract(TABLE_ID_MAIN, import_contracts)
+                if deleted > 0:
+                    print(f"[导入] 已清除 {deleted} 条旧主表记录")
+                # 再写新
                 written = write_df_to_bitable(
                     TABLE_ID_MAIN, df_main,
                     fields_map=MAIN_FIELD_MAP,
@@ -2938,7 +2988,7 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
                 results.append({"sheet": sheet_name, "ok": False, "error": f"主表写入异常: {e}"})
                 continue
 
-            # 2) 写入订单明细表
+            # 2) 写入订单明细表（先删后写）
             items_avail = [c for c in ["合同编号", "下单时间", "产品名称", "规格", "合同数量"] if c in df.columns]
             df_items = df[items_avail]
 
@@ -2952,6 +3002,13 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
             print(f"[导入] 明细表: {len(df_items)} 行")
 
             try:
+                item_contracts = list(set(df_items["合同编号"].apply(safe_str))) if "合同编号" in df_items.columns else []
+                # 先删旧
+                if item_contracts:
+                    deleted2 = delete_records_by_contract(TABLE_ID_ITEMS, item_contracts)
+                    if deleted2 > 0:
+                        print(f"[导入] 已清除 {deleted2} 条旧明细记录")
+                # 再写新
                 written2 = write_df_to_bitable(
                     TABLE_ID_ITEMS, df_items,
                     fields_map=ITEMS_FIELD_MAP,
@@ -3005,17 +3062,11 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
 
             print(f"[导入] 库存表: {len(df_inv_write)} 行")
 
-            # 先获取旧记录的 record_id，再写入新数据，只删旧记录
-            old_inv_ids = []
+            # 库存表全量覆盖：先清旧数据，再写入新数据
             try:
-                old_inv = fetch_bitable_to_df(TABLE_ID_INV)
-                if not old_inv.empty and "_record_id" in old_inv.columns:
-                    old_inv_ids = old_inv["_record_id"].dropna().astype(str).tolist()
-                    print(f"[导入] 旧库存 {len(old_inv_ids)} 条，准备覆盖")
-            except Exception as e:
-                print(f"[导入] 读取旧库存 record_id 失败（继续）: {e}")
-
-            try:
+                old_count = delete_all_records(TABLE_ID_INV)
+                if old_count > 0:
+                    print(f"[导入] 已清除库存旧数据 {old_count} 条")
                 written = write_df_to_bitable(
                     TABLE_ID_INV, df_inv_write,
                     fields_map=inv_field_map,
@@ -3024,18 +3075,6 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
                 if written <= 0:
                     results.append({"sheet": sheet_name, "ok": False, "error": "库存写入失败: 0 条"})
                 else:
-                    # 写入成功，删除旧记录
-                    if old_inv_ids:
-                        try:
-                            _post_batch(
-                                f"{BITABLE_BASE_URL}/{TABLE_ID_INV}/records/batch_delete",
-                                _feishu_headers(),
-                                [{"record_id": rid} for rid in old_inv_ids],
-                                "删除旧库存",
-                            )
-                            print(f"[导入] 已清除旧库存 {len(old_inv_ids)} 条")
-                        except Exception as e:
-                            print(f"[导入] 删除旧库存异常（新数据已写入）: {e}")
                     results.append({"sheet": sheet_name, "ok": True, "table": "库存快照表", "rows": len(df_inv_write), "warnings": []})
             except Exception as e:
                 results.append({"sheet": sheet_name, "ok": False, "error": f"库存写入异常: {e}"})
@@ -3044,6 +3083,34 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
             results.append({"sheet": sheet_name, "ok": False, "error": f"无法识别类型，列名: {list(cols)}"})
 
     all_ok = all(r.get("ok") for r in results)
+
+    # 导入成功后自动同步财务对账数据
+    if all_ok and orders_done:
+        try:
+            print("[导入] 自动同步财务对账数据...")
+            summary_r = _sync_finance_summary(force=True)
+            detail_r = _sync_finance_detail()
+            synced_count = summary_r.get("synced", 0)
+            created_count = detail_r.get("created", 0)
+            updated_count = detail_r.get("updated", 0)
+            finance_ok = summary_r.get("ok") and detail_r.get("ok")
+            results.append({
+                "sheet": "财务对账(自动)",
+                "ok": finance_ok,
+                "table": "财务对账总表+明细表",
+                "rows": synced_count + created_count + updated_count,
+                "warnings": [] if finance_ok else [
+                    summary_r.get("error", "") if not summary_r.get("ok") else "",
+                    detail_r.get("error", "") if not detail_r.get("ok") else "",
+                ]
+            })
+        except Exception as e:
+            results.append({
+                "sheet": "财务对账(自动)",
+                "ok": False,
+                "error": f"财务同步异常: {e}"
+            })
+
     return {"ok": all_ok, "results": results}
 
 
@@ -3420,7 +3487,46 @@ def get_today_report_row() -> dict:
     return report
 
 
-def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: dict) -> None:
+def _write_audit_record(audit_r: dict, batch_id: str, elapsed_s: float) -> None:
+    """将审计结果写入飞书「排单审计记录」表，独立异常不抛。"""
+    if not TABLE_ID_AUDIT:
+        return
+    try:
+        errors = audit_r.get("errors", [])
+        passed = 4 - len({e.split(":")[0] if ":" in e else "其他" for e in errors
+                          if any(k in str(e) for k in ["可用","判定","缺货SKU","发货"])})
+        passed = max(0, min(4, passed or (4 if not errors else 3)))
+
+        # 失败规则
+        failed = []
+        if any("可用" in str(e) or "available" in str(e) for e in errors): failed.append("库存可用量")
+        if any("判定" in str(e) or "gap" in str(e) or "矛盾" in str(e) for e in errors): failed.append("缺货判定")
+        if any("缺货SKU" in str(e) or "SKU数" in str(e) or "缺口总和" in str(e) for e in errors): failed.append("缺货SKU统计")
+        if any("发货" in str(e) or "日期" in str(e) for e in errors): failed.append("发货日期")
+
+        rule_text = f"{passed}/4"
+        if failed:
+            rule_text += f"（{','.join(failed[:2])}失败）"
+
+        fields = {
+            "排单批次号": batch_id,
+            "审计时间": int(datetime.now().timestamp() * 1000),
+            "审计通过": "是" if audit_r.get("ok") else "否",
+            "抽查合同数": audit_r.get("sample_count", 0),
+            "通过规则": rule_text,
+            "前3条异常": "\n".join(str(e)[:100] for e in errors[:3]) if errors else "",
+            "总耗时s": round(elapsed_s, 1),
+        }
+        write_df_to_bitable(TABLE_ID_AUDIT, pd.DataFrame([fields]),
+                           fields_map={k: k for k in fields},
+                           numeric_cols={"抽查合同数", "总耗时s"},
+                           date_cols={"审计时间"})
+        print(f"[审计] 审计记录已写入飞书表 {TABLE_ID_AUDIT}")
+    except Exception as e:
+        print(f"[审计] 审计记录写入失败: {e}")
+
+
+def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: dict, audit_result: dict = None) -> None:
     """排单完成后私聊通知排单负责人，失败不影响排单。"""
     planner_open_id = os.getenv("PLANNER_OPEN_ID", "").strip()
     if not planner_open_id:
@@ -3442,18 +3548,29 @@ def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: di
         shortage_sku = (report.get("库存缺货统计") or "").split("\n")[0] if report else ""
         ship_3d = report.get("未来3天应发货订单数", "0") if report else "0"
 
-        lines = [
-            f"**排单批次**：{batch_id}",
-            f"**本次排单**：{total} 份合同",
-            f"**待人工确认**：**{pending}** 份",
+        # ---- build dashboard column_set ----
+        dash_columns = [
+            {
+                "tag": "column",
+                "width": "weighted", "weight": 1,
+                "elements": [{"tag": "markdown", "content": f"**{total}**\n排单合同", "text_align": "center"}],
+            },
+            {
+                "tag": "column",
+                "width": "weighted", "weight": 1,
+                "elements": [{"tag": "markdown", "content": f"<font color='orange'>**{pending}**</font>\n<text_tag color='orange'>待确认</text_tag>", "text_align": "center"}],
+            },
+            {
+                "tag": "column",
+                "width": "weighted", "weight": 1,
+                "elements": [{"tag": "markdown", "content": f"**{ship_3d}**\n3天内应发", "text_align": "center"}],
+            },
         ]
         if shortage_orders > 0:
-            lines.append(f"**存在缺货**：{shortage_orders} 份合同需关注")
-        if shortage_sku:
-            lines.append(f"**紧缺物料**：{shortage_sku}")
-        lines.append(f"**未来3天应发货**：{ship_3d} 单")
+            dash_columns[1]["elements"][0]["content"] = f"<font color='red'>**{pending}**</font>\n<text_tag color='red'>待确认</text_tag>"
 
         # ---- 未来3天待发项目 ----
+        future_lines = ""
         if summary is not None and not summary.empty and "发货日期" in summary.columns:
             from datetime import date, timedelta
             today_date = date.today()
@@ -3466,8 +3583,6 @@ def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: di
             ].sort_values(by=["发货日期"], kind="stable", na_position="last")
 
             if not upcoming.empty:
-                lines.append("")
-                lines.append("**📦 未来3天待发项目**：")
                 from collections import defaultdict
                 by_date: dict = defaultdict(list)
                 for _, r in upcoming.iterrows():
@@ -3478,21 +3593,105 @@ def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: di
                     if sd and pname:
                         by_date[sd].append(pname)
 
+                fl = []
                 for sd in sorted(by_date.keys()):
                     names = by_date[sd]
-                    date_label = f"{sd.month}月{sd.day}日"
+                    date_label = f"{sd.month}/{sd.day}"
                     projects = "、".join(names[:5])
                     if len(names) > 5:
                         projects += f"等{len(names)}个"
-                    lines.append(f"• **{date_label}**：{projects}")
+                    fl.append(f"{date_label} {projects}")
+                future_lines = "\n".join(fl)
 
-        lines.append("")
-        lines.append(f"[查看排单总表](https://wl6wihmop1.feishu.cn/base/C5JzbAfnia0nT3sRvjucXgUGnDc?table=tbl09Z6C7wCGh3mW&view=vewiuVK8pH)")
+        # ---- 排单审计结果 ----
+        audit_line = ""
+        if audit_result:
+            total_contracts = len(summary) if summary is not None else 0
+            sample_n = audit_result.get("sample_count", 0)
+            errors = audit_result.get("errors", [])
+            audit_ok = audit_result.get("ok", True)
+            if audit_ok and not errors:
+                audit_line = f"<text_tag color='green'>审计通过</text_tag> 抽查{sample_n}/{total_contracts} 4/4规则无异常"
+            else:
+                audit_line = f"<text_tag color='red'>审计异常</text_tag> 抽查{sample_n}/{total_contracts} {len(errors)}项异常"
+
+        # ---- 紧缺物料（汇总全部缺货SKU，展示数量） ----
+        shortage_section = ""
+        if summary is not None and not summary.empty:
+            shortage_rows = summary[summary["整体状态"] == "缺货"]
+            if not shortage_rows.empty:
+                sku_counter: dict = {}
+                for _, row in shortage_rows.iterrows():
+                    sku_list_str = safe_str(row.get("缺货SKU列表", ""))
+                    if not sku_list_str:
+                        continue
+                    for sku in re.split(r"[,，]", sku_list_str):
+                        sku = sku.strip()
+                        if sku:
+                            sku_counter[sku] = sku_counter.get(sku, 0) + 1
+                if sku_counter:
+                    sorted_skus = sorted(sku_counter.items(), key=lambda x: x[1], reverse=True)
+                    total_kinds = len(sorted_skus)
+                    lines = [f"**缺货物料**：共 {total_kinds} 种"]
+                    for i, (sku, cnt) in enumerate(sorted_skus):
+                        if i >= 10:
+                            lines.append(f"+{total_kinds - 10} 种详见排单总表")
+                            break
+                        lines.append(f"{sku}    缺 {cnt} 个合同")
+                    shortage_section = "\n".join(lines)
+
+        # ---- 组装卡片 elements ----
+        elements = [
+            {"tag": "column_set", "flex_mode": "trisect", "columns": dash_columns},
+        ]
+        if future_lines:
+            elements.append({"tag": "hr"})
+            elements.append({"tag": "markdown", "content": f"**3天内待发项目**\n{future_lines}"})
+        if audit_line:
+            elements.append({"tag": "hr"})
+            elements.append({"tag": "markdown", "content": audit_line})
+        if shortage_section:
+            elements.append({"tag": "markdown", "content": shortage_section})
+
+        # 按钮区
+        scheduler_host = os.getenv("SCHEDULER_HOST", "http://localhost:8000")
+        confirm_url = f"{scheduler_host}/confirm_schedule?batch_id={batch_id}"
+        detail_url = os.getenv("BITABLE_DETAIL_URL", "https://wl6wihmop1.feishu.cn/base/C5JzbAfnia0nT3sRvjucXgUGnDc?table=tbl09Z6C7wCGh3mW&view=vewiuVK8pH")
+        audit_url = f"https://wl6wihmop1.feishu.cn/base/C5JzbAfnia0nT3sRvjucXgUGnDc?table={TABLE_ID_AUDIT}" if TABLE_ID_AUDIT else ""
+        buttons = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "确认排单"},
+                "type": "primary",
+                "value": {"batch_id": batch_id},
+                "url": confirm_url,
+            },
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "查看排单总表"},
+                "url": detail_url,
+                "type": "default",
+            },
+        ]
+        if audit_url:
+            buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "审计记录"},
+                "url": audit_url,
+                "type": "default",
+            })
+        elements.append({"tag": "action", "actions": buttons})
+
+        # note 时间戳
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        elements.append({"tag": "note", "elements": [
+            {"tag": "plain_text", "content": f"批次 {batch_id} | {now_ts}"}
+        ]})
 
         card = {
             "config": {"wide_screen_mode": True},
-            "header": {"template": "blue", "title": {"content": "AI排单已完成，请确认", "tag": "plain_text"}},
-            "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+            "header": {"template": "blue", "title": {"content": f"排单确认通知 ({batch_id})", "tag": "plain_text"}},
+            "elements": elements,
         }
 
         httpx.post(
@@ -3527,6 +3726,123 @@ def dispatch_schedule_notifications(report: dict) -> dict:
         return {"enabled": True, "ok": False, "error": f"通知模块配置缺失: {e}"}
     except Exception as e:
         return {"enabled": True, "ok": False, "error": str(e)}
+
+
+def _send_interim_notification(msg: str) -> None:
+    """排单完成后发送中间态短消息到采购群，不暴露数据详情。"""
+    try:
+        webhook_url = os.getenv("PROCUREMENT_WEBHOOK_URL", "")
+        if not webhook_url or "/bot/v2/hook" not in webhook_url:
+            return
+        payload = {"msg_type": "interactive", "card": {
+            "config": {"wide_screen_mode": True},
+            "header": {"template": "blue", "title": {"content": "排单完成，等待确认", "tag": "plain_text"}},
+            "elements": [{"tag": "markdown", "content": msg}],
+        }}
+        resp = httpx.post(webhook_url, json=payload, timeout=10.0,
+                          headers={"Content-Type": "application/json; charset=utf-8"})
+        if resp.json().get("code") == 0:
+            print("[中间态] 采购群中间态通知已发送")
+        else:
+            print(f"[中间态] 发送异常: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[中间态] 发送失败(不影响排单): {e}")
+
+
+def _read_report_from_daily_table(batch_id: str) -> dict | None:
+    """从日报表按 batch_id 读取排单日报数据。"""
+    try:
+        df = fetch_bitable_to_df(TABLE_ID_DAILY_REPORT)
+        if df is None or df.empty:
+            return None
+        mask = df["排单批次号"].astype(str).str.strip() == str(batch_id).strip()
+        matched = df[mask]
+        if matched.empty:
+            return None
+        row = matched.iloc[-1]  # 取最新一条
+        return {k: row[k] for k in row.index}
+    except Exception as e:
+        print(f"[确认] 从日报表读取失败: {e}")
+        return None
+
+
+def _write_confirmation_to_daily_table(batch_id: str, confirmed_by: str = "planner") -> bool:
+    """回写日报表的确认状态字段。"""
+    try:
+        df = fetch_bitable_to_df(TABLE_ID_DAILY_REPORT)
+        if df is None or df.empty:
+            return False
+        mask = df["排单批次号"].astype(str).str.strip() == str(batch_id).strip()
+        matched = df[mask]
+        if matched.empty:
+            return False
+        record_ids = matched["_record_id"].tolist()
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        update_payload = {
+            "records": [{
+                "record_id": rid,
+                "fields": {
+                    "确认状态": "已确认",
+                    "确认时间": now_ts,
+                    "确认人": confirmed_by,
+                }
+            } for rid in record_ids]
+        }
+        token = get_access_token()
+        resp = httpx.put(
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BITABLE_APP_TOKEN}/tables/{TABLE_ID_DAILY_REPORT}/records/batch_update",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=update_payload, timeout=15.0,
+        )
+        ok = resp.json().get("code") == 0
+        if ok:
+            print(f"[确认] 日报表回写成功: {batch_id}")
+        return ok
+    except Exception as e:
+        print(f"[确认] 日报表回写失败: {e}")
+        return False
+
+
+@app.get("/confirm")
+def confirm_panel():
+    """简易确认面板：列出日报表中最近的批次，一键推送群通知。"""
+    from fastapi.responses import HTMLResponse
+    try:
+        df = fetch_bitable_to_df(TABLE_ID_DAILY_REPORT)
+        if df is None or df.empty:
+            return HTMLResponse("<h3>暂无日报数据</h3>")
+        rows = []
+        for _, r in df.tail(10).iterrows():
+            b = str(r.get("排单批次号", "")).strip()
+            c = str(r.get("确认状态", "")).strip()
+            t = str(r.get("排单运行时间", "")).strip()
+            if isinstance(r["排单运行时间"], (int, float)):
+                t = datetime.fromtimestamp(r["排单运行时间"]/1000).strftime("%m/%d %H:%M") if r["排单运行时间"] > 1e10 else ""
+            btn = f'<a href="/confirm_schedule?batch_id={b}" style="background:#1456F0;color:#fff;padding:6px 16px;border-radius:6px;text-decoration:none;font-size:14px">确认发送</a>' if c != "已确认" else '<span style="color:#888;font-size:13px">已发送</span>'
+            rows.append(f'<tr><td style="padding:10px 16px">{b}</td><td style="padding:10px 16px">{t}</td><td style="padding:10px 16px">{c or "待确认"}</td><td style="padding:10px 16px">{btn}</td></tr>')
+        html = f"""<html><head><meta charset="utf-8"><title>排单确认面板</title><style>body{{font-family:-apple-system,sans-serif;max-width:800px;margin:40px auto;padding:0 20px}}table{{width:100%;border-collapse:collapse}}th{{text-align:left;padding:10px 16px;border-bottom:2px solid #ddd;font-size:13px;color:#666}}tr:hover{{background:#f5f5f5}}</style></head>
+<body><h2>排单确认面板</h2><p style="color:#888;font-size:13px">点击「确认发送」将日报推送到采购群和老板群</p>
+<table><tr><th>批次号</th><th>时间</th><th>状态</th><th>操作</th></tr>{''.join(reversed(rows))}</table></body></html>"""
+        return HTMLResponse(html)
+    except Exception as e:
+        return HTMLResponse(f"<h3>加载失败: {e}</h3>")
+
+@app.get("/confirm_schedule")
+def confirm_schedule(batch_id: str = ""):
+    """排单员确认排单后触发群通知（采购群 + 老板群）。"""
+    if not batch_id:
+        return {"ok": False, "error": "缺少 batch_id 参数"}
+    report = _read_report_from_daily_table(batch_id)
+    if not report:
+        return {"ok": False, "error": f"批次 {batch_id} 不存在，请确认批次号"}
+    confirmed = str(report.get("确认状态", "")).strip()
+    if confirmed == "已确认":
+        return {"ok": False, "error": "该批次已确认，无需重复操作"}
+    print(f"[确认] 排单员确认批次 {batch_id}，触发群通知...")
+    result = dispatch_schedule_notifications(report)
+    if result.get("ok"):
+        _write_confirmation_to_daily_table(batch_id, "planner")
+    return {"ok": result["ok"], "batch_id": batch_id, "details": result}
 
 
 # =========================
@@ -3749,9 +4065,9 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
     # =========================
     # 第二步：重新读取已回填的明细表
     # =========================
-    print("正在重新读取回填后的销售订单明细表...")
-    df_detail_reread = fetch_bitable_to_df(TABLE_ID_ITEMS)
-    df_detail = build_current_detail_for_summary(items, df_detail_reread, df_backfill)
+    # 不重读飞书 — 计算字段已由 backfill 覆盖，重读可能引入一致性延迟
+    # 且 build_current_detail_for_summary 的降级逻辑保证了内存数据始终被使用
+    df_detail = build_current_detail_for_summary(items, None, df_backfill)
 
     # 统一关键列类型（入口统一清洗，后续不再重复 astype）
     for required_col in ("合同编号", "SKU编码", "合同数量", "库存可用量", "缺口数量"):
@@ -3853,7 +4169,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 old_row = old_summary[old_summary["合同编号"] == contract_id]
                 if not old_row.empty:
                     old_status = normalize_order_status(old_row.iloc[0].get("订单状态", "待确认"))
-                    if old_status in {"已确认", "已发货"}:
+                    if old_status in {"已确认", "已发货", "已签收"}:
                         print(f"[锁] 合同 {contract_id} 订单状态={old_status}，信任人工状态并跳过AI重算")
                         summary_rows.append(old_row.iloc[0].to_dict())
                         continue
@@ -3943,8 +4259,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 "缺货SKU列表": ', '.join(shortage_sku_names),
                 "整体状态": overall_status,
                 "AI建议发货时间": (
-                    "" if shortage_sku_count > 0
-                    else date_to_yyyy_mm_dd(next_working_day(ship_date)) if ship_date else ""
+                    date_to_yyyy_mm_dd(next_working_day(ship_date)) if ship_date else ""
                 ),
                 "AI风险": "",
                 "AI建议": "",
@@ -4102,9 +4417,11 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
     # 汇总数据 → 批量写入 AI排单总表
     print("正在写入 AI排单总表...")
+    # 只写入目标表存在的字段，去除 下单日期/商务/代理商（AI排单结果表无这些字段）
+    detail_cols = [c for c in summary.columns if c not in {"下单日期", "商务", "代理商"}]
     upsert_err = upsert_bitable_records_by_key(
         TABLE_ID_DETAIL,
-        summary,
+        summary[detail_cols],
         key_col="合同编号",
         key_field_name="合同编号",
         numeric_cols=SUMMARY_NUMERIC_COLS_DEFAULT,
@@ -4165,6 +4482,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
 
     # ===== 生成 AI排单日报 =====
     daily_report_written = 0
+    audit_r = None  # initialized for scope
     notification_result = {"enabled": False, "ok": False, "error": "未生成日报，未触发通知"}
     if TABLE_ID_DAILY_REPORT:
         try:
@@ -4185,15 +4503,52 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
                 )
                 daily_report_written = 1
                 print("AI排单日报生成完成")
-                print("正在触发飞书三线机器人通知...")
-                notification_result = dispatch_schedule_notifications(report)
-                if notification_result.get("ok"):
-                    print("飞书三线机器人通知已触发")
-                else:
-                    print(f"飞书三线机器人通知失败(不影响排单): {notification_result.get('error')}")
+
+                # ---- 群通知延后：排单员确认后再发送 ----
+                # 仅发中间态通知给采购群
+                shortage_sku_count = int(report.get("库存缺货SKU数", 0) if report else 0)
+                interim_msg = f"今日排单完成（{len(summary)} 份合同）"
+                if shortage_sku_count > 0:
+                    interim_msg += f"，{shortage_sku_count} 种物料紧缺"
+                interim_msg += "，完整日报排单员确认后推送"
+                _send_interim_notification(interim_msg)
+                notification_result = {"enabled": True, "ok": True, "error": ""}
+
+                # ----- 排单审计（随机5合同全链路复查） -----
+                audit_r = None
+                try:
+                    from shared import audit_schedule_results
+                    audit_r = audit_schedule_results(
+                        df_summary=summary, items_df=items, inv_df=inv, sku_df=sku, sample_size=5,
+                        occupied_stock=occupied_stock, find_inv_row_fn=find_inventory_row,
+                    )
+                    print(f"[审计] 抽查 {audit_r['sample_count']} 合同: "
+                          + ("✅ 通过" if audit_r['ok'] else f"❌ {len(audit_r['errors'])}错误"))
+                    if audit_r.get("errors"):
+                        for e in audit_r["errors"][:5]:
+                            print(f"  ❌ {e}")
+                except Exception as e:
+                    print(f"[审计] 审计执行异常（不影响排单）: {e}")
+                    audit_r = {"ok": True, "errors": [], "warnings": []}
+
+                # 写入审计记录表
+                try:
+                    if TABLE_ID_AUDIT and audit_r:
+                        _write_audit_record(audit_r, batch_id, time.time() - t_start)
+                except Exception as e:
+                    print(f"[审计] 审计记录写入失败（不影响排单）: {e}")
 
                 # ----- 私聊通知排单完成 -----
-                _send_personal_notification(summary, batch_id, report)
+                _send_personal_notification(summary, batch_id, report, audit_result=audit_r)
+
+                # ----- 自动确认（测试模式） -----
+                if os.getenv("AUTO_CONFIRM", "").lower() in ("true", "1", "yes"):
+                    print("[自动确认] 测试模式，自动触群发通知...")
+                    try:
+                        cr = confirm_schedule(batch_id=batch_id)
+                        print(f"[自动确认] 结果: {cr}")
+                    except Exception as e:
+                        print(f"[自动确认] 异常: {e}")
         except Exception as e:
             print(f"AI排单日报生成失败(不影响排单): {e}")
     else:
@@ -4229,6 +4584,7 @@ def run_scheduler(payload: ScheduleRequest = ScheduleRequest()):
         "日报写入": daily_report_written,
         "飞书通知": notification_result,
         "批次号": batch_id,
+        "审计": audit_r,
         "elapsed_s": round(elapsed, 1),
         "notes": "回填已更新销售订单明细表原记录；总表按合同编号更新/新增；AI仅生成待确认；库存预留已按待确认订单刷新"
     }
@@ -4480,10 +4836,13 @@ def _scan_and_analyze_doc(doc_url: str, question: str) -> dict:
 
     content = ""
     try:
+        env = os.environ.copy()
+        env["LARK_API_TOKEN"] = token
         result = _sp.run(
-            [lark_cli_path, "--profile", "main-app", "docs", "+fetch", "--token", token, "--format", "text"],
+            [lark_cli_path, "--profile", "main-app", "docs", "+fetch", "--format", "text"],
             capture_output=True,
             encoding="utf-8",
+            env=env,
             timeout=60,
         )
         if result.returncode != 0:
@@ -5510,10 +5869,13 @@ async def feishu_webhook(request: Request):
 
 
 @app.post("/finance/sync")
-def finance_sync():
-    """同步财务对账数据：总表 ← 销售订单主表，明细表 ← 销售订单明细表 + 计费规则匹配。"""
+def finance_sync(force: bool = False):
+    """同步财务对账数据：总表 ← 销售订单主表，明细表 ← 销售订单明细表 + 计费规则匹配。
+    
+    force=true 时强制重同步所有未锁定合同（覆盖已同步状态）。
+    """
     try:
-        summary_result = _sync_finance_summary()
+        summary_result = _sync_finance_summary(force=force)
         detail_result = _sync_finance_detail()
 
         return {

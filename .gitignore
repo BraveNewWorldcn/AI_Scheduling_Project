@@ -21,3 +21,5 @@ server.log
 .workbuddy/
 .DS_Store
 Thumbs.db
+.vs/
+~$*
