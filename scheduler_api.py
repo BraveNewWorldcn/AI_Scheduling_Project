@@ -1178,7 +1178,7 @@ def _sync_finance_detail() -> Dict[str, Any]:
     if to_update:
         update_df = pd.DataFrame(to_update)
         update_bitable_records(TABLE_ID_FINANCE_DETAIL, update_df, record_id_col="_record_id",
-                               numeric_cols={"合同数量", "包干合同单采数量", "小计"})
+                               numeric_cols={"合同数量", "包干合同单采数量", "单采价格", "小计"})
 
     if to_create:
         create_df = pd.DataFrame(to_create)
@@ -1626,7 +1626,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 TABLE_ID_FINANCE_DETAIL,
                 detail_write,
                 record_id_col="_record_id",
-                numeric_cols={"包干合同单采数量", "小计"},
+                numeric_cols={"包干合同单采数量", "单采价格", "小计"},
             )
             print(f"[Finance Calc] 已更新现有记录数: {len(detail_write)}")
 
@@ -1666,7 +1666,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
         write_df_to_bitable(
             TABLE_ID_FINANCE_DETAIL,
             new_detail_df,
-            numeric_cols={"合同数量", "包干合同单采数量", "小计"},
+            numeric_cols={"合同数量", "包干合同单采数量", "单采价格", "小计"},
         )
 
     # ========== 步骤5: 回写总表（AI费用检查 + AI项目金额）==========
@@ -1701,7 +1701,7 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
                 TABLE_ID_FINANCE_SUMMARY,
                 su_to_update,
                 record_id_col="_record_id",
-                numeric_cols=set(),
+                numeric_cols={"AI项目金额"},
             )
 
     return {
