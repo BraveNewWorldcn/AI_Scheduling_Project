@@ -2647,8 +2647,9 @@ async function importExcel(){
   try{
     const r=await fetch('/import',{method:'POST',body:fd});
     const d=await r.json();
-    if(d.ok){st.textContent='导入成功! '+d.results.map(x=>x.sheet+':'+x.rows+'行').join(', ');}
-    else{st.textContent='导入失败: '+d.results.map(x=>x.sheet+':'+(x.error||'OK')).join(', ');}
+    const results=d.results||[{sheet:'?',error:d.error||'未知错误'}];
+    if(d.ok){st.textContent='导入成功! '+results.map(x=>x.sheet+':'+x.rows+'行').join(', ');}
+    else{st.textContent='导入失败: '+results.map(x=>x.sheet+':'+(x.error||'OK')).join(', ');}
   }catch(e){st.textContent='网络错误: '+e.message;}
 }
 async function runSchedule(){
@@ -2893,7 +2894,7 @@ async def import_excel(file: UploadFile = File(...), auto_fix: bool = Form(False
         contents = await file.read()
         xl = pd.ExcelFile(io.BytesIO(contents))
     except Exception as e:
-        return {"ok": False, "error": f"无法读取 Excel 文件: {e}"}
+        return {"ok": False, "results": [{"sheet": file.filename or "unknown", "ok": False, "error": f"无法读取 Excel 文件: {e}"}]}
 
     results = []
     orders_done = False
