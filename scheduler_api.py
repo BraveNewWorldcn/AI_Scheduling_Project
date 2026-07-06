@@ -1219,11 +1219,27 @@ def _sync_finance_detail() -> Dict[str, Any]:
                 repair_fields["规格"] = "定制"
                 needs_repair = True
 
+            # 规格为空时从计费规则补全
+            if (not sp or sp.lower() in ("nan",)) and cur_spec and cur_spec.lower() not in ("nan", ""):
+                matched_rule = billing_df[billing_df["Spec_ID"].astype(str).str.strip() == cur_spec]
+                if not matched_rule.empty:
+                    rule_spec = safe_str(matched_rule.iloc[0].get("规格型号", ""))
+                    if rule_spec:
+                        repair_fields["规格"] = rule_spec
+                        needs_repair = True
+
             # Spec_ID 为空 → 重新匹配
             if (not cur_spec or cur_spec.lower() in ("nan",)) and pn:
                 new_spec = _match_spec_id(pn, sp, billing_df)
                 if new_spec:
                     repair_fields["Spec_ID"] = new_spec
+                    # 同时补全规格（从计费规则中取匹配到的规格型号）
+                    if not sp or sp.lower() in ("nan",):
+                        matched_rule = billing_df[billing_df["Spec_ID"].astype(str).str.strip() == new_spec]
+                        if not matched_rule.empty:
+                            rule_spec = safe_str(matched_rule.iloc[0].get("规格型号", ""))
+                            if rule_spec:
+                                repair_fields["规格"] = rule_spec
                     needs_repair = True
 
             # Spec_ID 可能有误（之前模糊匹配结果），用精确匹配重新校验
