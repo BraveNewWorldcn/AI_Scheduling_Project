@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>排单确认面板</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:860px;margin:40px auto;padding:0 20px;background:#f5f6f8}
+h1{font-size:22px;font-weight:600;margin-bottom:4px;color:#1f2329}
+.subtitle{font-size:13px;color:#8f959e;margin-bottom:24px}
+.demo-badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:8px;background:#e6f7ff;color:#1890ff;margin-left:8px;vertical-align:2px}
+.card{background:#fff;border-radius:12px;padding:16px 20px;margin-bottom:12px;display:flex;align-items:center;justify-content:space-between;gap:16px;border:1px solid #e5e6eb}
+.card:hover{background:#fafbfc}
+.info{flex:1;min-width:0}
+.batch{font-size:15px;font-weight:500;color:#1f2329}
+.contract-count{font-size:12px;color:#8f959e;margin-top:2px}
+.time{font-size:12px;color:#8f959e;margin-top:1px}
+.status{font-size:13px;padding:3px 10px;border-radius:10px;font-weight:500}
+.pending{background:#fff7e6;color:#d48806}
+.confirmed{background:#f0fff0;color:#389e0d}
+.failed{background:#fff0f0;color:#cf1322}
+.btn{padding:8px 20px;border-radius:8px;border:none;font-size:14px;font-weight:500;cursor:pointer;white-space:nowrap;transition:all .15s}
+.btn-confirm{background:#1456f0;color:#fff}
+.btn-confirm:hover{background:#0e44c4}
+.btn-confirm:disabled{background:#d3d8e0;cursor:not-allowed}
+.btn-confirm.confirming{background:#52c41a;pointer-events:none}
+.loading{text-align:center;padding:40px;color:#8f959e}
+.error{text-align:center;padding:40px;color:#e24b4a}
+.empty{text-align:center;padding:60px 20px;color:#c9cdd4}
+.summary{background:#fff;border-radius:12px;padding:14px 20px;margin-bottom:20px;border:1px solid #e5e6eb;display:flex;gap:32px;font-size:13px;color:#646a73}
+.summary strong{color:#1f2329;font-size:18px;font-weight:600;margin-right:4px}
+.config-bar{background:#fff;border-radius:12px;padding:12px 16px;margin-bottom:16px;border:1px solid #e5e6eb;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.config-bar label{font-size:12px;color:#c9cdd4}
+.config-bar input{flex:1;min-width:180px;padding:6px 10px;border:1px solid #e5e6eb;border-radius:6px;font-size:13px;color:#c9cdd4}
+.config-bar input:focus{outline:none;border-color:#1456f0;color:#1f2329}
+.config-bar button{padding:6px 14px;border-radius:6px;border:1px solid #d3d8e0;background:#fff;font-size:13px;cursor:pointer;color:#646a73}
+.config-bar button:hover{background:#f5f6f8}
+.divider{height:1px;background:#e5e6eb;margin:20px 0}
+</style>
+</head>
+<body>
+<h1>排单确认面板<span class="demo-badge">Demo</span></h1>
+<p class="subtitle">确认后将日报推送到采购群和老板群</p>
+
+<div id="summary" class="summary"></div>
+<div id="content"></div>
+
+<div class="divider"></div>
+<div class="config-bar">
+  <label>后端地址（可选）</label>
+  <input type="text" id="schedulerHost" value="" placeholder="http://your-server:8000">
+  <button onclick="connectBackend()">连接真实数据</button>
+</div>
+
+<script>
+const DEMO_FIELDS='确认状态';
+const APP_TOKEN='C5JzbAfnia0nT3sRvjucXgUGnDc';
+const TABLE_ID='tblF0dgaoF3B60Ng';
+let mode='demo';
+
+function pad(n){return n.toString().padStart(2,'0')}
+function nowStr(offsetMinutes){
+  const d=new Date(Date.now()+offsetMinutes*60000);
+  return `${d.getMonth()+1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+const DEMO_BATCHES=[
+  {batch:'BN-20260621-004',contracts:61,runTime:nowStr(0),status:'pending'},
+  {batch:'BN-20260621-003',contracts:58,runTime:nowStr(-30),status:'confirmed'},
+  {batch:'BN-20260620-002',contracts:52,runTime:nowStr(-90),status:'confirmed'},
+  {batch:'BN-20260620-001',contracts:47,runTime:nowStr(-180),status:'confirmed'},
+  {batch:'BN-20260619-003',contracts:55,runTime:nowStr(-360),status:'failed'},
+];
+
+function renderBatches(items){
+  const summaryEl=document.getElementById('summary');
+  const contentEl=document.getElementById('content');
+
+  const pending=items.filter(i=>i.status==='pending').length;
+  const confirmed=items.filter(i=>i.status==='confirmed').length;
+  const totalContracts=items.reduce((s,i)=>s+(i.contracts||0),0);
+
+  summaryEl.innerHTML=`
+    <div>待确认 <strong>${pending}</strong> 批</div>
+    <div>已发送 <strong>${confirmed}</strong> 批</div>
+    <div>覆盖合同 <strong>${totalContracts}</strong> 份</div>
+  `;
+
+  if(!items.length){contentEl.innerHTML='<div class="empty">暂无批次数据</div>';return}
+
+  let html='';
+  for(const item of items){
+    const isPending=item.status==='pending';
+    const isFailed=item.status==='failed';
+    const statusLabel=isPending?'待确认':isFailed?'发送失败':'已发送';
+    const statusClass=isPending?'pending':isFailed?'failed':'confirmed';
+    html+=`<div class="card">
+      <div class="info">
+        <div class="batch">${item.batch}</div>
+        <div class="contract-count">${item.contracts} 份合同 &middot; ${item.runTime}</div>
+      </div>
+      <span class="status ${statusClass}">${statusLabel}</span>
+      ${isPending?`<button class="btn btn-confirm" onclick="doConfirm(this,'${item.batch}')">确认发送</button>`:''}
+    </div>`;
+  }
+  contentEl.innerHTML=html;
+}
+
+function doConfirm(btn,batch){
+  btn.textContent='发送中...';
+  btn.className='btn btn-confirm confirming';
+  btn.disabled=true;
+  setTimeout(()=>{
+    const target=DEMO_BATCHES.find(b=>b.batch===batch);
+    if(target) target.status='confirmed';
+    renderBatches(DEMO_BATCHES);
+    mode='demo';
+  },1200);
+}
+
+async function connectBackend(){
+  const contentEl=document.getElementById('content');
+  const host=document.getElementById('schedulerHost').value.replace(/\/$/,'').trim();
+  if(!host){alert('请先填写后端地址');return}
+
+  contentEl.className='loading';contentEl.textContent='正在连接后端...';
+
+  try{
+    const r=await fetch(`${host}/confirm_batches`,{signal:AbortSignal.timeout(8000)});
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d=await r.json();
+    if(!d.items||!d.items.length){contentEl.innerHTML='<div class="empty">后端无批次数据</div>';return}
+    mode='live';
+    renderBatches(d.items);
+    document.querySelector('.demo-badge').textContent='Live';
+    document.querySelector('.demo-badge').style.background='#f6ffed';
+    document.querySelector('.demo-badge').style.color='#52c41a';
+  }catch(e){
+    contentEl.className='error';
+    contentEl.innerHTML=`<div>后端连接失败</div><div style="font-size:12px;color:#c9cdd4;margin-top:4px">${e.message}</div><div style="margin-top:12px"><button class="btn btn-confirm" onclick="loadDemo()" style="font-size:13px">返回 Demo 模式</button></div>`;
+  }
+}
+
+function loadDemo(){
+  mode='demo';
+  document.querySelector('.demo-badge').textContent='Demo';
+  document.querySelector('.demo-badge').style.background='#e6f7ff';
+  document.querySelector('.demo-badge').style.color='#1890ff';
+  renderBatches(DEMO_BATCHES);
+}
+
+loadDemo();
+</script>
+</body>
+</html>
