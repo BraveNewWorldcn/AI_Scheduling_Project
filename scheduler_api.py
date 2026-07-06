@@ -3652,8 +3652,8 @@ def _send_personal_notification(summary: pd.DataFrame, batch_id: str, report: di
         # 按钮区
         scheduler_host = os.getenv("SCHEDULER_HOST", "http://localhost:8000")
         confirm_url = f"{scheduler_host}/confirm_schedule?batch_id={batch_id}"
-        detail_url = os.getenv("BITABLE_DETAIL_URL", "https://wl6wihmop1.feishu.cn/base/C5JzbAfnia0nT3sRvjucXgUGnDc?table=tbl09Z6C7wCGh3mW&view=vewiuVK8pH")
-        audit_url = f"https://wl6wihmop1.feishu.cn/base/C5JzbAfnia0nT3sRvjucXgUGnDc?table={TABLE_ID_AUDIT}" if TABLE_ID_AUDIT else ""
+        detail_url = os.getenv("BITABLE_DETAIL_URL", f"https://wl6wihmop1.feishu.cn/base/{BITABLE_APP_TOKEN}?table=tbl09Z6C7wCGh3mW&view=vewiuVK8pH")
+        audit_url = f"https://wl6wihmop1.feishu.cn/base/{BITABLE_APP_TOKEN}?table={TABLE_ID_AUDIT}" if TABLE_ID_AUDIT else ""
         buttons = [
             {
                 "tag": "button",
