@@ -48,15 +48,17 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px;color:#1f2329}
 
 <div class="divider"></div>
 <div class="config-bar">
-  <label>后端地址（可选）</label>
+  <label>后端</label>
   <input type="text" id="schedulerHost" value="" placeholder="http://your-server:8000">
+  <label>APP_TOKEN</label>
+  <input type="text" id="appToken" value="" placeholder="飞书多维表格 Base ID">
   <button onclick="connectBackend()">连接真实数据</button>
 </div>
 
 <script>
 const DEMO_FIELDS='确认状态';
-const APP_TOKEN='C5JzbAfnia0nT3sRvjucXgUGnDc';
-const TABLE_ID='tblF0dgaoF3B60Ng';
+function getAppToken(){ return document.getElementById('appToken').value.trim() || localStorage.getItem('appToken') || ''; }
+function getTableId(){ return localStorage.getItem('tableId') || 'tblF0dgaoF3B60Ng'; }
 let mode='demo';
 
 function pad(n){return n.toString().padStart(2,'0')}
@@ -123,6 +125,8 @@ async function connectBackend(){
   const contentEl=document.getElementById('content');
   const host=document.getElementById('schedulerHost').value.replace(/\/$/,'').trim();
   if(!host){alert('请先填写后端地址');return}
+  const token=document.getElementById('appToken').value.trim();
+  if(token){ localStorage.setItem('appToken',token); }
 
   contentEl.className='loading';contentEl.textContent='正在连接后端...';
 
