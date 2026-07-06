@@ -7,6 +7,8 @@ import uvicorn
 import os
 import sys
 
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 # ----- 自动加载 .env 文件 -----
 def _load_dotenv():
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
