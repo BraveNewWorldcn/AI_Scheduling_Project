@@ -966,7 +966,7 @@ def _sync_finance_summary(force: bool = False) -> Dict[str, Any]:
 
 
 def _match_spec_id(product_name: str, spec: str, billing_df: pd.DataFrame) -> str:
-    """根据产品名称和规格匹配计费规则表中的 Spec_ID（仅精确匹配+别名）。"""
+    """根据产品名称和规格匹配计费规则表中的 Spec_ID。"""
     if billing_df.empty or (not product_name and not spec):
         return ""
 
@@ -995,19 +995,38 @@ def _match_spec_id(product_name: str, spec: str, billing_df: pd.DataFrame) -> st
                 val = rule.get("Spec_ID", "")
                 return str(val).strip() if pd.notna(val) else ""
 
-    # 3. 关键词匹配（仅限 AC-RB800 规格的消控室值班助手产品，优先级从高到低）
-    if "ac-rb800" in spec_norm.lower():
-        keywords = [
-            ("主键盘", "SPEC-RB800-KZP"),
-            ("总线盘", "SPEC-RB800-ZXP"),
-            ("总键盘", "SPEC-RB800-ZXP"),
-            ("电话", "SPEC-RB800-PHONE"),
-            ("多线盘", "SPEC-RB800-DXP"),
-            ("广播", "SPEC-RB800-BROAD"),
+    # 3. 关键词匹配：从产品名提取类型关键词（主键盘/多线盘/总线盘/电话/广播）
+    keywords = [
+        ("主键盘", "SPEC-RB800-KZP"),
+        ("总线盘", "SPEC-RB800-ZXP"),
+        ("总键盘", "SPEC-RB800-ZXP"),
+        ("电话", "SPEC-RB800-PHONE"),
+        ("多线盘", "SPEC-RB800-DXP"),
+        ("广播", "SPEC-RB800-BROAD"),
+    ]
+    for kw, sid in keywords:
+        if kw in product_name_norm:
+            return sid
+
+    # 4. 规格为空时：仅按产品名称精确匹配（忽略规格差异）
+    if not spec_norm:
+        name_match = billing_df[
+            billing_df["产品名称"].astype(str).str.strip() == product_name_norm
         ]
-        for kw, sid in keywords:
-            if kw in product_name_norm:
-                return sid
+        if not name_match.empty:
+            val = name_match.iloc[0].get("Spec_ID", "")
+            return str(val).strip() if pd.notna(val) else ""
+
+    # 5. 规格为空时：检查导入产品名是否包含计费规则产品名（前向包含匹配）
+    if not spec_norm:
+        billing_names = billing_df["产品名称"].astype(str).str.strip()
+        for _, rule in billing_df.iterrows():
+            rule_name = str(rule.get("产品名称", "")).strip()
+            if not rule_name:
+                continue
+            if rule_name in product_name_norm:
+                val = rule.get("Spec_ID", "")
+                return str(val).strip() if pd.notna(val) else ""
 
     # 未匹配 → 需在计费规则表中补充
     print(f"[WARNING] 计费规则未匹配: 产品={product_name_norm}, 规格={spec_norm} —— 请在产品计费规则主表中补充该产品")
