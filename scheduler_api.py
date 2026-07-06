@@ -299,7 +299,6 @@ def fetch_bitable_to_df(table_id: str) -> pd.DataFrame:
     """从飞书读取表格，返回清洗后的 DataFrame（缓存 token 复用）。"""
     records = _fetch_table_records(table_id)
     df = _records_to_df(records)
-    print(f"[DEBUG] 读取表 {table_id} 的列名: {list(df.columns)}")
     return df
 
 
@@ -1321,7 +1320,6 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
             if product_name and spec_model:
                 key = (product_name, spec_model)
                 product_spec_index[key] = sid
-    print(f"[DEBUG] billing_index 共 {len(billing_index)} 条规则，product_spec_index 共 {len(product_spec_index)} 条映射")
 
     # 修复消防远程控制设备费的规格（从 SPEC-EQP 改为定制，便于后续匹配）
     if "规格" in detail_df.columns and "产品名称" in detail_df.columns:
@@ -1329,7 +1327,6 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
         if mask.any():
             detail_df = detail_df.copy()  # 避免SettingWithCopyWarning
             detail_df.loc[mask, "规格"] = "定制"
-            print(f"[DEBUG] 已修复 {mask.sum()} 条消防远程控制设备费的规格（SPEC-EQP → 定制）")
 
     # 锁定合同列表
     locked_contracts: Set[str] = set()
@@ -1508,7 +1505,6 @@ def _run_finance_calculate(threshold: int = 3) -> Dict[str, Any]:
             key = (product_name, spec_model)
             if key in product_spec_index:
                 spec_id = product_spec_index[key]
-                print(f"[DEBUG] 备选匹配：产品={safe_str(detail_row.get('产品名称', ''))}, 规格={safe_str(detail_row.get('规格', ''))} → Spec_ID={spec_id}")
 
         # 产品未匹配计费规则 → 跳过核算，保留明细表已有价格数据，禁止写 0
         if not spec_id or spec_id not in billing_index:
