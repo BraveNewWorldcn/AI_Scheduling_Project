@@ -1,0 +1,4 @@
+# 跳过换行符批量变更的 commit，避免 git blame 噪音
+# 使用方式: git blame --ignore-revs-file .git-blame-ignore-revs <file>
+# 可配置为默认: git config blame.ignoreRevsFile .git-blame-ignore-revs
+d25634b6803bbde8a57e32e74b753c288a829f6e
