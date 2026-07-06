@@ -65,6 +65,8 @@ def main():
         host="0.0.0.0",
         port=8000,
         reload=False,
+        workers=2,
+        timeout_keep_alive=300,
         log_level="info"
     )
 
