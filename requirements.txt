@@ -9,3 +9,4 @@ python-multipart==0.0.6
 openai>=1.0.0
 python-dotenv>=1.0.0
 openpyxl>=3.1.0
+xlrd>=2.0.0
