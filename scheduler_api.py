@@ -945,7 +945,7 @@ def _sync_finance_summary(force: bool = False) -> Dict[str, Any]:
     sync_df = sync_df[sync_df.apply(lambda r: (
         safe_str(r.get("人工核对金额", "")) == ""
     ), axis=1)]
-    if not force:
+    if not force and "同步状态" in sync_df.columns:
         sync_df = sync_df[sync_df["同步状态"] != "已同步"]
     print(f"[Finance Sync Summary] {before} → {len(sync_df)} (force={force}, 跳过已锁定/{'跳过已同步' if not force else '含已同步'})")
     if sync_df.empty:
