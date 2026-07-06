@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ai-scheduling.scheduler</string>
+    <!--
+    macOS launchd 守护进程配置
+    部署步骤:
+      1. 修改 ProgramArguments 中的 Python 路径为实际路径
+      2. 修改 WorkingDirectory 为项目实际路径
+      3. cp com.ai-scheduling.scheduler.plist ~/Library/LaunchAgents/
+      4. launchctl load ~/Library/LaunchAgents/com.ai-scheduling.scheduler.plist
+      5. launchctl start com.ai-scheduling.scheduler
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>scheduler_api.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/AI_Scheduling_Project</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/scheduler_daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/scheduler_daemon_err.log</string>
+</dict>
+</plist>
